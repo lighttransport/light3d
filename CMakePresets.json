@@ -1,0 +1,88 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 15,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "LIGHT3D_BUILD_EXAMPLES": "ON"
+      }
+    },
+    {
+      "name": "debug",
+      "displayName": "Debug Build",
+      "description": "Debug build with full debug symbols",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    },
+    {
+      "name": "release",
+      "displayName": "Release Build",
+      "description": "Optimized release build",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
+      "name": "cpp20",
+      "displayName": "C++20 with Coroutines",
+      "description": "Release build with C++20 and coroutine support",
+      "inherits": "release",
+      "cacheVariables": {
+        "LIGHT3D_ENABLE_CPP20": "ON"
+      }
+    },
+    {
+      "name": "vulkan",
+      "displayName": "Vulkan Backend",
+      "description": "Build with Vulkan backend support",
+      "inherits": "release",
+      "cacheVariables": {
+        "LIGHT3D_ENABLE_VULKAN": "ON"
+      }
+    },
+    {
+      "name": "wasm",
+      "displayName": "WebAssembly",
+      "description": "WASM build using Emscripten",
+      "inherits": "base",
+      "toolchainFile": "${sourceDir}/cmake/emscripten.toolchain.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "LIGHT3D_ENABLE_WEBGPU": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "debug",
+      "configurePreset": "debug"
+    },
+    {
+      "name": "release",
+      "configurePreset": "release"
+    },
+    {
+      "name": "cpp20",
+      "configurePreset": "cpp20"
+    },
+    {
+      "name": "vulkan",
+      "configurePreset": "vulkan"
+    },
+    {
+      "name": "wasm",
+      "configurePreset": "wasm"
+    }
+  ]
+}

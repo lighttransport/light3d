@@ -55,14 +55,34 @@ source ./emsdk_env.sh  # Linux/macOS
 
 ### Native Build (Linux/macOS/Windows)
 
+**Using build scripts:**
 ```bash
-# Default Release build
-./build_native.sh
+# Linux/macOS
+./build_native.sh         # Release build (default)
+./build_native.sh Debug   # Debug build
 
-# Debug build
-./build_native.sh Debug
+# Windows
+build_native.bat          # Release build (default)
+build_native.bat Debug    # Debug build
+```
 
-# Or manually with CMake + Ninja
+**Using CMake Presets (CMake 3.19+):**
+```bash
+# List available presets
+cmake --list-presets
+
+# Configure and build with a preset
+cmake --preset release     # Standard release build
+cmake --preset debug       # Debug build
+cmake --preset cpp20       # C++20 with coroutines
+cmake --preset vulkan      # With Vulkan support
+
+# Build
+cmake --build build/release
+```
+
+**Manual CMake configuration:**
+```bash
 mkdir build && cd build
 cmake -G Ninja -DCMAKE_BUILD_TYPE=Release ..
 ninja

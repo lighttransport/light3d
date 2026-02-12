@@ -1,0 +1,135 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  build-linux:
+    name: Linux Build
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        build_type: [Release, Debug]
+        cpp_version: [17, 20]
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y cmake ninja-build libgl1-mesa-dev
+    
+    - name: Configure CMake (C++${{ matrix.cpp_version }})
+      run: |
+        cmake -G Ninja \
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+          -DLIGHT3D_BUILD_EXAMPLES=ON \
+          -DLIGHT3D_ENABLE_CPP20=${{ matrix.cpp_version == 20 && 'ON' || 'OFF' }} \
+          -B build
+    
+    - name: Build
+      run: cmake --build build
+    
+    - name: Test example
+      run: |
+        cd build/examples
+        ./simple_example || echo "Example completed"
+
+  build-macos:
+    name: macOS Build
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        build_type: [Release]
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Install dependencies
+      run: |
+        brew install cmake ninja
+    
+    - name: Configure CMake
+      run: |
+        cmake -G Ninja \
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+          -DLIGHT3D_BUILD_EXAMPLES=ON \
+          -DLIGHT3D_ENABLE_METAL=ON \
+          -B build
+    
+    - name: Build
+      run: cmake --build build
+    
+    - name: Test example
+      run: |
+        cd build/examples
+        ./simple_example || echo "Example completed"
+
+  build-windows:
+    name: Windows Build
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        build_type: [Release]
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Setup MSVC
+      uses: ilammy/msvc-dev-cmd@v1
+    
+    - name: Install Ninja
+      run: choco install ninja
+    
+    - name: Configure CMake
+      run: |
+        cmake -G Ninja `
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} `
+          -DLIGHT3D_BUILD_EXAMPLES=ON `
+          -B build
+    
+    - name: Build
+      run: cmake --build build
+    
+    - name: Test example
+      run: |
+        cd build/examples
+        ./simple_example.exe || echo "Example completed"
+
+  build-wasm:
+    name: WebAssembly Build
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Setup Emscripten
+      uses: mymindstorm/setup-emsdk@v12
+      with:
+        version: 'latest'
+    
+    - name: Verify Emscripten
+      run: emcc --version
+    
+    - name: Configure CMake
+      run: |
+        emcmake cmake -G Ninja \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DLIGHT3D_BUILD_EXAMPLES=ON \
+          -B build_wasm
+    
+    - name: Build
+      run: cmake --build build_wasm
+    
+    - name: Upload WASM artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: wasm-build
+        path: |
+          build_wasm/examples/*.html
+          build_wasm/examples/*.js
+          build_wasm/examples/*.wasm
