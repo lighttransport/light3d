@@ -6,10 +6,15 @@ on:
   pull_request:
     branches: [ main, develop ]
 
+permissions:
+  contents: read
+
 jobs:
   build-linux:
     name: Linux Build
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     strategy:
       matrix:
         build_type: [Release, Debug]
@@ -42,6 +47,8 @@ jobs:
   build-macos:
     name: macOS Build
     runs-on: macos-latest
+    permissions:
+      contents: read
     strategy:
       matrix:
         build_type: [Release]
@@ -72,6 +79,8 @@ jobs:
   build-windows:
     name: Windows Build
     runs-on: windows-latest
+    permissions:
+      contents: read
     strategy:
       matrix:
         build_type: [Release]
@@ -103,6 +112,8 @@ jobs:
   build-wasm:
     name: WebAssembly Build
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     
     steps:
     - uses: actions/checkout@v3
