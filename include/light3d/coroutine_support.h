@@ -21,7 +21,7 @@ struct Task {
     std::coroutine_handle<promise_type> handle;
     
     explicit Task(std::coroutine_handle<promise_type> h) : handle(h) {}
-    ~Task() { if (handle) handle.destroy(); }
+    ~Task() noexcept { if (handle) handle.destroy(); }
     
     Task(const Task&) = delete;
     Task& operator=(const Task&) = delete;
