@@ -22,3 +22,8 @@ endif()
 install(TARGETS simple_example
     RUNTIME DESTINATION bin
 )
+
+# OpenGL viewer example (requires GLAD + GLFW, not available on Emscripten)
+if(NOT EMSCRIPTEN AND LIGHT3D_ENABLE_OPENGL)
+    add_subdirectory(glview)
+endif()

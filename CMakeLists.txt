@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.15)
 project(light3d 
     VERSION 0.1.0
     DESCRIPTION "Lightweight 3D engine supporting OpenGL/Metal/Vulkan and WebGL/WebGPU"
-    LANGUAGES CXX
+    LANGUAGES C CXX
 )
 
 # Set default build type
@@ -55,6 +55,11 @@ message(STATUS "  OpenGL: ${LIGHT3D_ENABLE_OPENGL}")
 message(STATUS "  Metal: ${LIGHT3D_ENABLE_METAL}")
 message(STATUS "  Vulkan: ${LIGHT3D_ENABLE_VULKAN}")
 message(STATUS "  WebGPU: ${LIGHT3D_ENABLE_WEBGPU}")
+
+# Vendored dependencies (GLAD + GLFW) – not needed for Emscripten
+if(NOT EMSCRIPTEN)
+    add_subdirectory(deps)
+endif()
 
 # Add subdirectories
 add_subdirectory(src)

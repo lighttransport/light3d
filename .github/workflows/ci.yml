@@ -26,7 +26,8 @@ jobs:
     - name: Install dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y cmake ninja-build libgl1-mesa-dev
+        sudo apt-get install -y cmake ninja-build libgl1-mesa-dev \
+          libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev
     
     - name: Configure CMake (C++${{ matrix.cpp_version }})
       run: |
