@@ -1,6 +1,14 @@
-add_library(light3d 
+add_library(light3d
     engine.cpp
     renderer_opengl.cpp
+    math.cpp
+    prim.cpp
+    xform.cpp
+    stage.cpp
+    mesh_data.cpp
+    skeleton.cpp
+    skel_animation.cpp
+    timeline.cpp
 )
 
 target_include_directories(light3d PUBLIC

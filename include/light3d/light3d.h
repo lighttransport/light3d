@@ -63,6 +63,15 @@ class Geometry;
 class Material;
 class Mesh;
 
+// Scene graph forward declarations
+class Stage;
+class Timeline;
+class Prim;
+class Xform;
+class MeshPrim;
+class SkeletonPrim;
+class SkelAnimationPrim;
+
 // Engine configuration
 struct EngineConfig {
     RenderBackend backend = RenderBackend::None;
@@ -85,7 +94,9 @@ public:
     virtual void render() = 0;
     
     virtual Renderer* getRenderer() = 0;
-    
+    virtual Stage* getStage() = 0;
+    virtual Timeline* getTimeline() = 0;
+
     static std::unique_ptr<Engine> create(RenderBackend backend);
 };
 

@@ -1,4 +1,6 @@
 #include "light3d/light3d.h"
+#include "light3d/stage.h"
+#include "light3d/timeline.h"
 #include <iostream>
 
 namespace light3d {
@@ -126,7 +128,9 @@ public:
         running_ = true;
         scene_ = std::make_unique<Scene>();
         camera_ = std::make_unique<Camera>();
-        
+        stage_ = std::make_unique<Stage>();
+        timeline_ = std::make_unique<Timeline>();
+
         return true;
     }
     
@@ -143,7 +147,11 @@ public:
     }
     
     void update(float deltaTime) override {
-        // Update logic here
+        if (timeline_ && stage_) {
+            timeline_->advance(deltaTime);
+            timeline_->evaluate(*stage_);
+            stage_->updateWorldTransforms();
+        }
     }
     
     void render() override {
@@ -157,13 +165,23 @@ public:
     Renderer* getRenderer() override {
         return renderer_.get();
     }
-    
+
+    Stage* getStage() override {
+        return stage_.get();
+    }
+
+    Timeline* getTimeline() override {
+        return timeline_.get();
+    }
+
 private:
     RenderBackend backend_;
     bool running_;
     std::unique_ptr<Renderer> renderer_;
     std::unique_ptr<Scene> scene_;
     std::unique_ptr<Camera> camera_;
+    std::unique_ptr<Stage> stage_;
+    std::unique_ptr<Timeline> timeline_;
 };
 
 // Factory function
