@@ -1,5 +1,11 @@
+#ifdef GLVIEW_OPENGL_ENABLED
 #include <glad/glad.h>
+#endif
 #include <GLFW/glfw3.h>
+
+#ifdef GLVIEW_VULKAN_ENABLED
+#include "vk_backend.h"
+#endif
 
 #include <light3d/light3d.h>
 
@@ -183,6 +189,19 @@ static Mat4 perspective(float fovDeg, float aspect, float near, float far) {
     return r;
 }
 
+// Vulkan clip space: Y-down, Z=[0,1]
+static Mat4 perspectiveVk(float fovDeg, float aspect, float nearP, float farP) {
+    float fovRad = fovDeg * (3.14159265f / 180.0f);
+    float tanHalf = std::tan(fovRad * 0.5f);
+    Mat4 r;
+    r.at(0, 0) = 1.0f / (aspect * tanHalf);
+    r.at(1, 1) = -1.0f / tanHalf;  // negate Y for Vulkan
+    r.at(2, 2) = farP / (nearP - farP);  // Z remap to [0,1]
+    r.at(3, 2) = -1.0f;
+    r.at(2, 3) = -(farP * nearP) / (farP - nearP);
+    return r;
+}
+
 static Mat4 lookAt(Vec3 eye, Vec3 target, Vec3 up) {
     Vec3 f = normalize(target - eye);
     Vec3 r = normalize(cross(f, up));
@@ -266,19 +285,24 @@ struct OrbitCamera {
 };
 
 // ---------------------------------------------------------------------------
-// Mesh
+// Mesh (OpenGL)
 // ---------------------------------------------------------------------------
+#ifdef GLVIEW_OPENGL_ENABLED
 struct Mesh {
     GLuint vao = 0, vbo = 0;
     int vertexCount = 0;
 };
+#endif
 
 // ---------------------------------------------------------------------------
 // SceneObject
 // ---------------------------------------------------------------------------
 struct SceneObject {
     std::string name;
+#ifdef GLVIEW_OPENGL_ENABLED
     Mesh* mesh = nullptr;  // shared, not owned
+#endif
+    int meshIndex = 0;  // index into mesh array (for Vulkan path)
     Vec3 position = {0, 0, 0};
     Vec3 scl = {1, 1, 1};
     BBox localBBox;
@@ -314,6 +338,10 @@ static int gRenderMode = 5;
 // Scene objects
 static std::vector<SceneObject> gObjects;
 
+// Backend selection
+static bool gUseVulkan = false;
+
+#ifdef GLVIEW_OPENGL_ENABLED
 // Pick FBO
 static GLuint gPickFBO = 0;
 static GLuint gPickColorTex = 0;
@@ -322,9 +350,15 @@ static int gPickFBOWidth = 0, gPickFBOHeight = 0;
 
 // Checkerboard texture
 static GLuint gCheckerTex = 0;
+#endif
 
+#ifdef GLVIEW_VULKAN_ENABLED
+static VulkanBackend* gVkBackend = nullptr;
+#endif
+
+#ifdef GLVIEW_OPENGL_ENABLED
 // ---------------------------------------------------------------------------
-// Shader sources
+// Shader sources (OpenGL)
 // ---------------------------------------------------------------------------
 
 // --- Color shader (modes 4 & 5, grid, axis, selection box) ---
@@ -558,6 +592,7 @@ static GLuint createProgram(const char* vsSrc, const char* fsSrc) {
     glDeleteShader(fs);
     return prog;
 }
+#endif // GLVIEW_OPENGL_ENABLED
 
 // ---------------------------------------------------------------------------
 // Vertex format: pos(3) + color(3) + normal(3) + uv(2) = 11 floats
@@ -582,6 +617,7 @@ static void pushVertexSimple(std::vector<float>& buf,
     pushVertex(buf, x, y, z, r, g, b, 0, 1, 0, 0, 0);
 }
 
+#ifdef GLVIEW_OPENGL_ENABLED
 static Mesh createMesh(const std::vector<float>& verts) {
     Mesh m;
     m.vertexCount = static_cast<int>(verts.size()) / kVertStride;
@@ -620,10 +656,18 @@ static Mesh createMesh(const std::vector<float>& verts) {
     return m;
 }
 
+static void destroyMesh(Mesh& m) {
+    glDeleteVertexArrays(1, &m.vao);
+    glDeleteBuffers(1, &m.vbo);
+    m.vao = m.vbo = 0;
+    m.vertexCount = 0;
+}
+#endif // GLVIEW_OPENGL_ENABLED
+
 // ---------------------------------------------------------------------------
-// Geometry builders
+// Geometry builders (return vertex data; upload happens separately)
 // ---------------------------------------------------------------------------
-static Mesh buildGrid(int halfExtent, float step) {
+static std::vector<float> buildGridVerts(int halfExtent, float step) {
     std::vector<float> verts;
     float gray = 0.4f;
     float limit = static_cast<float>(halfExtent) * step;
@@ -634,10 +678,10 @@ static Mesh buildGrid(int halfExtent, float step) {
         pushVertexSimple(verts, -limit, 0, pos, gray, gray, gray);
         pushVertexSimple(verts,  limit, 0, pos, gray, gray, gray);
     }
-    return createMesh(verts);
+    return verts;
 }
 
-static Mesh buildAxis(float length) {
+static std::vector<float> buildAxisVerts(float length) {
     std::vector<float> verts;
     pushVertexSimple(verts, 0, 0, 0, 1, 0, 0);
     pushVertexSimple(verts, length, 0, 0, 1, 0, 0);
@@ -645,10 +689,10 @@ static Mesh buildAxis(float length) {
     pushVertexSimple(verts, 0, length, 0, 0, 1, 0);
     pushVertexSimple(verts, 0, 0, 0, 0, 0, 1);
     pushVertexSimple(verts, 0, 0, length, 0, 0, 1);
-    return createMesh(verts);
+    return verts;
 }
 
-static Mesh buildCube() {
+static std::vector<float> buildCubeVerts() {
     std::vector<float> verts;
 
     struct Face {
@@ -694,11 +738,11 @@ static Mesh buildCube() {
         pushVertex(verts, f.v[3][0], f.v[3][1], f.v[3][2], f.r, f.g, f.b, n.x, n.y, n.z, uvs[3][0], uvs[3][1]);
     }
 
-    return createMesh(verts);
+    return verts;
 }
 
 // Unit wireframe cube for selection highlight (-0.5 to +0.5), 12 edges, 24 verts
-static Mesh buildBBoxWireframe() {
+static std::vector<float> buildBBoxWireframeVerts() {
     std::vector<float> verts;
     float y = 1.0f; // yellow
 
@@ -719,19 +763,13 @@ static Mesh buildBBoxWireframe() {
         pushVertexSimple(verts, c[e[0]][0], c[e[0]][1], c[e[0]][2], y, y, 0);
         pushVertexSimple(verts, c[e[1]][0], c[e[1]][1], c[e[1]][2], y, y, 0);
     }
-    return createMesh(verts);
-}
-
-static void destroyMesh(Mesh& m) {
-    glDeleteVertexArrays(1, &m.vao);
-    glDeleteBuffers(1, &m.vbo);
-    m.vao = m.vbo = 0;
-    m.vertexCount = 0;
+    return verts;
 }
 
 // ---------------------------------------------------------------------------
-// Checkerboard texture (64x64, 8px cells)
+// Checkerboard texture (64x64, 8px cells) [OpenGL only]
 // ---------------------------------------------------------------------------
+#ifdef GLVIEW_OPENGL_ENABLED
 static GLuint createCheckerTexture() {
     const int sz = 64;
     const int cell = 8;
@@ -755,6 +793,7 @@ static GLuint createCheckerTexture() {
     glBindTexture(GL_TEXTURE_2D, 0);
     return tex;
 }
+#endif // GLVIEW_OPENGL_ENABLED
 
 // ---------------------------------------------------------------------------
 // Embedded 8x16 bitmap font (CP437 style, ASCII 32-126 + box-drawing)
@@ -1067,10 +1106,12 @@ struct TuiCell {
 static int gTuiCols = 0, gTuiRows = 0;
 static std::vector<TuiCell> gTuiCells;
 
+#ifdef GLVIEW_OPENGL_ENABLED
 // TUI GL resources
 static GLuint gTuiProg = 0;
 static GLuint gTuiFontTex = 0;
 static GLuint gTuiVAO = 0, gTuiVBO = 0, gTuiIBO = 0;
+#endif
 
 // TUI state
 static bool gShowInspector = true;
@@ -1100,6 +1141,7 @@ static const int kAtlasRows = (kFontGlyphCount + kAtlasCols - 1) / kAtlasCols;
 static const int kAtlasW = kAtlasCols * kFontGlyphW;  // 128
 static const int kAtlasH = kAtlasRows * kFontGlyphH;  // 112
 
+#ifdef GLVIEW_OPENGL_ENABLED
 // ---------------------------------------------------------------------------
 // Font texture atlas creation
 // ---------------------------------------------------------------------------
@@ -1142,6 +1184,7 @@ static void tuiInitGL() {
     glGenBuffers(1, &gTuiVBO);
     glGenBuffers(1, &gTuiIBO);
 }
+#endif // GLVIEW_OPENGL_ENABLED
 
 // ---------------------------------------------------------------------------
 // TUI drawing API
@@ -1516,6 +1559,7 @@ static void tuiCompose() {
 // ---------------------------------------------------------------------------
 // TUI geometry builder and renderer
 // ---------------------------------------------------------------------------
+#ifdef GLVIEW_OPENGL_ENABLED
 // Vertex: vec2 pos, vec2 uv, vec3 fg, vec3 bg, float bgAlpha = 11 floats
 static const int kTuiVertFloats = 11;
 
@@ -1814,6 +1858,7 @@ static int performRayPick(GLFWwindow* window, const Mat4& view, const Mat4& proj
     }
     return bestId;
 }
+#endif // GLVIEW_OPENGL_ENABLED
 
 // ---------------------------------------------------------------------------
 // Fit camera to scene / selection
@@ -1863,9 +1908,18 @@ static void fitCameraToSelection() {
 // ---------------------------------------------------------------------------
 static void framebufferSizeCb(GLFWwindow* /*window*/, int width, int height) {
     if (height == 0) height = 1;
-    glViewport(0, 0, width, height);
     gAspect = static_cast<float>(width) / static_cast<float>(height);
-    tuiResize(width, height);
+#ifdef GLVIEW_OPENGL_ENABLED
+    if (!gUseVulkan) {
+        glViewport(0, 0, width, height);
+        tuiResize(width, height);
+    }
+#endif
+#ifdef GLVIEW_VULKAN_ENABLED
+    if (gUseVulkan && gVkBackend) {
+        gVkBackend->onResize(width, height);
+    }
+#endif
 }
 
 static void executeCommand(const std::string& cmd) {
@@ -2172,22 +2226,46 @@ static void scrollCb(GLFWwindow* /*window*/, double /*xoffset*/,
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
-int main() {
-    std::printf("Light3D v%s – OpenGL viewer example\n",
-                light3d::getVersionString().c_str());
+int main(int argc, char** argv) {
+    // -----------------------------------------------------------------------
+    // Parse CLI flags
+    // -----------------------------------------------------------------------
+    gUseVulkan = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--vulkan") == 0) {
+#ifdef GLVIEW_VULKAN_ENABLED
+            gUseVulkan = true;
+#else
+            std::fprintf(stderr, "Warning: Vulkan support not compiled in, "
+                                 "falling back to OpenGL\n");
+#endif
+        } else if (std::strcmp(argv[i], "--opengl") == 0) {
+            gUseVulkan = false;
+        }
+    }
 
+    std::printf("Light3D v%s – %s viewer example\n",
+                light3d::getVersionString().c_str(),
+                gUseVulkan ? "Vulkan" : "OpenGL");
+
+    // -----------------------------------------------------------------------
     // GLFW init
+    // -----------------------------------------------------------------------
     if (!glfwInit()) {
         std::fprintf(stderr, "Failed to initialise GLFW\n");
         return EXIT_FAILURE;
     }
 
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
-    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+    if (!gUseVulkan) {
+        glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+        glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
+        glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
 #ifdef __APPLE__
-    glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
+        glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
 #endif
+    } else {
+        glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
+    }
 
     int winW = 800, winH = 600;
     GLFWmonitor* primary = glfwGetPrimaryMonitor();
@@ -2231,13 +2309,135 @@ int main() {
             gAspect = static_cast<float>(fbW) / static_cast<float>(fbH);
     }
 
-    glfwMakeContextCurrent(window);
+    // GLFW callbacks (shared between backends)
     glfwSetFramebufferSizeCallback(window, framebufferSizeCb);
     glfwSetKeyCallback(window, keyCb);
     glfwSetMouseButtonCallback(window, mouseButtonCb);
     glfwSetCursorPosCallback(window, cursorPosCb);
     glfwSetScrollCallback(window, scrollCb);
     glfwSetCharCallback(window, charCb);
+
+    // -----------------------------------------------------------------------
+    // Build vertex data (shared between backends)
+    // -----------------------------------------------------------------------
+    std::vector<float> gridVerts = buildGridVerts(10, 1.0f);
+    std::vector<float> axisVerts = buildAxisVerts(2.0f);
+    std::vector<float> cubeVerts = buildCubeVerts();
+    std::vector<float> bboxVerts = buildBBoxWireframeVerts();
+
+    // Local bounding box of the cube mesh (±0.5)
+    BBox cubeBBox;
+    cubeBBox.mn = {-0.5f, -0.5f, -0.5f};
+    cubeBBox.mx = { 0.5f,  0.5f,  0.5f};
+
+    // -----------------------------------------------------------------------
+    // Vulkan path
+    // -----------------------------------------------------------------------
+#ifdef GLVIEW_VULKAN_ENABLED
+    VulkanBackend vkBackend;
+    VkMesh vkGrid, vkAxis, vkCube, vkBbox;
+
+    if (gUseVulkan) {
+        gVkBackend = &vkBackend;
+
+        if (!vkBackend.init(window)) {
+            std::fprintf(stderr, "Failed to initialise Vulkan backend\n");
+            glfwTerminate();
+            return EXIT_FAILURE;
+        }
+
+        vkGrid = vkBackend.createMesh(gridVerts);
+        vkAxis = vkBackend.createMesh(axisVerts);
+        vkCube = vkBackend.createMesh(cubeVerts);
+        vkBbox = vkBackend.createMesh(bboxVerts);
+
+        // Scene objects
+        {
+            SceneObject obj;
+            obj.name = "CubeCenter";
+            obj.meshIndex = 0;
+            obj.position = {0, 0.5f, 0};
+            obj.scl = {1, 1, 1};
+            obj.localBBox = cubeBBox;
+            obj.pickId = 1;
+            gObjects.push_back(obj);
+        }
+        {
+            SceneObject obj;
+            obj.name = "CubeRight";
+            obj.meshIndex = 0;
+            obj.position = {3, 0.5f, 0};
+            obj.scl = {1, 1, 1};
+            obj.localBBox = cubeBBox;
+            obj.pickId = 2;
+            gObjects.push_back(obj);
+        }
+        {
+            SceneObject obj;
+            obj.name = "CubeBack";
+            obj.meshIndex = 0;
+            obj.position = {0, 0.5f, -3};
+            obj.scl = {1, 1, 1};
+            obj.localBBox = cubeBBox;
+            obj.pickId = 3;
+            gObjects.push_back(obj);
+        }
+
+        std::printf("Vulkan: rendering %zu objects\n", gObjects.size());
+
+        // Vulkan render loop
+        while (!glfwWindowShouldClose(window)) {
+            glfwPollEvents();
+
+            Mat4 view = gCamera.getViewMatrix();
+            Mat4 proj = perspectiveVk(45.0f, gAspect, 0.1f, 100.0f);
+            Mat4 vp = proj * view;
+            Mat4 identity = Mat4::identity();
+
+            if (!vkBackend.beginFrame()) continue;
+
+            // Grid + Axis (lines)
+            vkBackend.draw(vkGrid, identity.m, vp.m, VK_PRIMITIVE_TOPOLOGY_LINE_LIST);
+            vkBackend.draw(vkAxis, identity.m, vp.m, VK_PRIMITIVE_TOPOLOGY_LINE_LIST);
+
+            // Scene objects (triangles)
+            for (auto& obj : gObjects) {
+                Mat4 model = obj.modelMatrix();
+                vkBackend.draw(vkCube, model.m, vp.m, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
+            }
+
+            // Selection wireframe bbox
+            for (auto& obj : gObjects) {
+                if (!obj.selected) continue;
+                BBox wb = obj.worldBBox();
+                Vec3 center = wb.center();
+                Vec3 sz = wb.size();
+                Mat4 bboxModel = Mat4::translate(center) * Mat4::scale(sz);
+                vkBackend.draw(vkBbox, bboxModel.m, vp.m, VK_PRIMITIVE_TOPOLOGY_LINE_LIST);
+            }
+
+            vkBackend.endFrame();
+        }
+
+        // Vulkan cleanup
+        vkBackend.destroyMesh(vkGrid);
+        vkBackend.destroyMesh(vkAxis);
+        vkBackend.destroyMesh(vkCube);
+        vkBackend.destroyMesh(vkBbox);
+        vkBackend.cleanup();
+        gVkBackend = nullptr;
+
+        glfwDestroyWindow(window);
+        glfwTerminate();
+        return EXIT_SUCCESS;
+    }
+#endif // GLVIEW_VULKAN_ENABLED
+
+    // -----------------------------------------------------------------------
+    // OpenGL path
+    // -----------------------------------------------------------------------
+#ifdef GLVIEW_OPENGL_ENABLED
+    glfwMakeContextCurrent(window);
     glfwSwapInterval(1);
 
     // GLAD init
@@ -2288,17 +2488,12 @@ int main() {
     GLint uLitAmbient    = glGetUniformLocation(progLit, "uAmbient");
 
     // -----------------------------------------------------------------------
-    // Build geometry
+    // Upload geometry to GL
     // -----------------------------------------------------------------------
-    Mesh grid = buildGrid(10, 1.0f);
-    Mesh axis = buildAxis(2.0f);
-    Mesh cubeMesh = buildCube();
-    Mesh bboxWire = buildBBoxWireframe();
-
-    // Local bounding box of the cube mesh (±0.5)
-    BBox cubeBBox;
-    cubeBBox.mn = {-0.5f, -0.5f, -0.5f};
-    cubeBBox.mx = { 0.5f,  0.5f,  0.5f};
+    Mesh grid = createMesh(gridVerts);
+    Mesh axis = createMesh(axisVerts);
+    Mesh cubeMesh = createMesh(cubeVerts);
+    Mesh bboxWire = createMesh(bboxVerts);
 
     // -----------------------------------------------------------------------
     // Scene objects (3 cubes sharing the same mesh)
@@ -2536,6 +2731,7 @@ int main() {
     glDeleteVertexArrays(1, &gTuiVAO);
     glDeleteBuffers(1, &gTuiVBO);
     glDeleteBuffers(1, &gTuiIBO);
+#endif // GLVIEW_OPENGL_ENABLED
 
     glfwDestroyWindow(window);
     glfwTerminate();

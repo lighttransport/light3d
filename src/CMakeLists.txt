@@ -58,16 +58,11 @@ elseif(WIN32)
     endif()
 endif()
 
-# Vulkan support
+# Vulkan support (via volk meta-loader – no Vulkan SDK required)
 if(LIGHT3D_ENABLE_VULKAN)
-    find_package(Vulkan)
-    if(Vulkan_FOUND)
-        target_sources(light3d PRIVATE renderer_vulkan.cpp)
-        target_link_libraries(light3d PUBLIC Vulkan::Vulkan)
-        target_compile_definitions(light3d PUBLIC LIGHT3D_VULKAN_ENABLED)
-    else()
-        message(WARNING "Vulkan not found. Vulkan backend will not be available.")
-    endif()
+    target_sources(light3d PRIVATE renderer_vulkan.cpp)
+    target_link_libraries(light3d PUBLIC volk)
+    target_compile_definitions(light3d PUBLIC LIGHT3D_VULKAN_ENABLED)
 endif()
 
 # C++20 coroutine support
