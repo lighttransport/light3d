@@ -6,6 +6,7 @@ add_library(light3d
     xform.cpp
     stage.cpp
     mesh_data.cpp
+    material.cpp
     skeleton.cpp
     skel_animation.cpp
     skinning.cpp

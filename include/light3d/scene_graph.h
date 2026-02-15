@@ -7,6 +7,7 @@
 #include "xform.h"
 #include "stage.h"
 #include "mesh_data.h"
+#include "material.h"
 #include "skeleton.h"
 #include "skel_animation.h"
 #include "skinning.h"

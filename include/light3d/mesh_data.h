@@ -12,6 +12,7 @@ struct MeshGeometry {
     std::vector<Vec3> uvs;           // stored as Vec3 for flexibility (u, v, 0)
     std::vector<int> faceVertexCounts;   // e.g. {3, 3, 4} = tri, tri, quad
     std::vector<int> faceVertexIndices;  // indices into points
+    std::vector<int> faceMaterialIds;    // one per face, index into MaterialLibrary
 
     // Skinning data (per-vertex)
     std::vector<Vec4> jointIndices;  // up to 4 joint influences per vertex (as float)
@@ -19,6 +20,7 @@ struct MeshGeometry {
 
     size_t vertexCount() const { return points.size(); }
     size_t faceCount() const { return faceVertexCounts.size(); }
+    bool hasPerFaceMaterials() const { return !faceMaterialIds.empty(); }
     bool hasSkinning() const { return !jointWeights.empty(); }
 };
 
