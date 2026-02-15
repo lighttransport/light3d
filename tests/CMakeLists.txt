@@ -1,0 +1,12 @@
+function(add_light3d_test name source)
+    add_executable(${name} ${source})
+    target_link_libraries(${name} PRIVATE light3d)
+    target_include_directories(${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    add_test(NAME ${name} COMMAND ${name})
+endfunction()
+
+add_light3d_test(test_math test_math.cpp)
+add_light3d_test(test_primitives test_primitives.cpp)
+add_light3d_test(test_scene_graph test_scene_graph.cpp)
+add_light3d_test(test_obj_loader test_obj_loader.cpp)
+add_light3d_test(test_material test_material.cpp)

@@ -8,6 +8,7 @@
 #endif
 
 #include <light3d/light3d.h>
+#include <light3d/node_animation.h>
 #include <light3d/obj_loader.h>
 
 #include <algorithm>
@@ -346,6 +347,10 @@ static bool gUseVulkan = false;
 // OBJ file to load (empty = demo scene)
 static std::string gObjFilePath;
 
+// Animation playback
+static bool gAnimPlaying = false;
+static float gAnimTime = 0.0f;
+
 #ifdef GLVIEW_OPENGL_ENABLED
 // Pick FBO
 static GLuint gPickFBO = 0;
@@ -455,6 +460,8 @@ void main() {
 }
 )";
 
+static const int kMaxLights = 4;
+
 static const char* kLitFS = R"(
 #version 330 core
 in vec3 vColor;
@@ -462,22 +469,66 @@ in vec3 vNormal;
 in vec3 vWorldPos;
 out vec4 FragColor;
 
-uniform vec3 uLightDir;
+// type: 0=directional, 1=point, 2=spot
+struct Light {
+    int type;
+    vec3 direction;
+    vec3 position;
+    vec3 color;
+    float intensity;
+    float range;
+    float innerCone;
+    float outerCone;
+};
+
+const int MAX_LIGHTS = 4;
+uniform int uNumLights;
+uniform Light uLights[MAX_LIGHTS];
 uniform vec3 uCameraPos;
-uniform vec3 uLightColor;
 uniform float uAmbient;
 
 void main() {
     vec3 N = normalize(vNormal);
-    vec3 L = normalize(uLightDir);
     vec3 V = normalize(uCameraPos - vWorldPos);
-    vec3 H = normalize(L + V);
 
-    float diff = max(dot(N, L), 0.0);
-    float spec = pow(max(dot(N, H), 0.0), 32.0);
+    vec3 result = vColor * uAmbient;
 
-    vec3 color = vColor * (uAmbient + diff * uLightColor) + spec * uLightColor * 0.3;
-    FragColor = vec4(color, 1.0);
+    for (int i = 0; i < MAX_LIGHTS; ++i) {
+        if (i >= uNumLights) break;
+        Light lt = uLights[i];
+
+        vec3 L;
+        float atten = lt.intensity;
+
+        if (lt.type == 0) {
+            // Directional
+            L = normalize(lt.direction);
+        } else {
+            // Point or Spot
+            vec3 toLight = lt.position - vWorldPos;
+            float dist = length(toLight);
+            L = toLight / max(dist, 0.001);
+            if (lt.range > 0.0)
+                atten *= clamp(1.0 - dist / lt.range, 0.0, 1.0);
+
+            if (lt.type == 2) {
+                // Spot cone falloff
+                float cosTheta = dot(-L, normalize(lt.direction));
+                float cosOuter = cos(lt.outerCone);
+                float cosInner = cos(lt.innerCone);
+                float spotFactor = clamp((cosTheta - cosOuter) / max(cosInner - cosOuter, 0.001), 0.0, 1.0);
+                atten *= spotFactor;
+            }
+        }
+
+        float diff = max(dot(N, L), 0.0);
+        vec3 H = normalize(L + V);
+        float spec = pow(max(dot(N, H), 0.0), 32.0);
+
+        result += vColor * diff * lt.color * atten + spec * lt.color * atten * 0.3;
+    }
+
+    FragColor = vec4(result, 1.0);
 }
 )";
 
@@ -1936,6 +1987,19 @@ static int performRayPick(GLFWwindow* window, const Mat4& view, const Mat4& proj
 #endif // GLVIEW_OPENGL_ENABLED
 
 // ---------------------------------------------------------------------------
+// Apply NodeAnimationClip to scene objects by matching name == targetPath
+// ---------------------------------------------------------------------------
+static void applyAnimToObjects(const light3d::NodeAnimationClip& clip, float time) {
+    for (auto& obj : gObjects) {
+        const light3d::NodeTransformTrack* trk = clip.findTrack(obj.name);
+        if (!trk) continue;
+        light3d::TransformSample s = trk->sample(time);
+        obj.position = {s.translation.x, s.translation.y, s.translation.z};
+        obj.scl = {s.scale.x, s.scale.y, s.scale.z};
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Fit camera to scene / selection
 // ---------------------------------------------------------------------------
 static void fitCameraToAll() {
@@ -2166,6 +2230,10 @@ static void keyCb(GLFWwindow* window, int key, int /*scancode*/, int action,
     if (key == GLFW_KEY_A) fitCameraToAll();
     if (key == GLFW_KEY_F) fitCameraToSelection();
     if (key == GLFW_KEY_I) gShowInspector = !gShowInspector;
+    if (key == GLFW_KEY_SPACE) {
+        gAnimPlaying = !gAnimPlaying;
+        termLog("Animation: %s", gAnimPlaying ? "playing" : "paused");
+    }
 
     if (key >= GLFW_KEY_4 && key <= GLFW_KEY_7) {
         const char* names[] = {"", "", "", "", "Wireframe", "Shading", "Shading+Texture", "Lighting"};
@@ -2440,6 +2508,36 @@ int main(int argc, char** argv) {
     }
 
     // -----------------------------------------------------------------------
+    // Demo animation (for demo scene only)
+    // -----------------------------------------------------------------------
+    light3d::NodeAnimationClip demoAnim("demo");
+    float animDuration = 0.0f;
+    if (!objLoaded) {
+        // CubeCenter: bounces up and down
+        demoAnim.addTranslationKey("CubeCenter", 0.0f, light3d::Vec3(0, 0.5f, 0));
+        demoAnim.addTranslationKey("CubeCenter", 1.0f, light3d::Vec3(0, 2.0f, 0));
+        demoAnim.addTranslationKey("CubeCenter", 2.0f, light3d::Vec3(0, 0.5f, 0));
+
+        // CubeRight: orbits around center
+        constexpr float r = 3.0f;
+        constexpr int orbSteps = 8;
+        for (int i = 0; i <= orbSteps; ++i) {
+            float t = 4.0f * static_cast<float>(i) / static_cast<float>(orbSteps);
+            float angle = 6.28318530f * static_cast<float>(i) / static_cast<float>(orbSteps);
+            demoAnim.addTranslationKey("CubeRight", t,
+                light3d::Vec3(r * std::cos(angle), 0.5f, r * std::sin(angle)));
+        }
+
+        // CubeBack: scales pulsing
+        demoAnim.addScaleKey("CubeBack", 0.0f, light3d::Vec3(1, 1, 1));
+        demoAnim.addScaleKey("CubeBack", 1.5f, light3d::Vec3(1.5f, 1.5f, 1.5f));
+        demoAnim.addScaleKey("CubeBack", 3.0f, light3d::Vec3(1, 1, 1));
+
+        animDuration = 4.0f;
+        demoAnim.setDuration(animDuration);
+    }
+
+    // -----------------------------------------------------------------------
     // Vulkan path
     // -----------------------------------------------------------------------
 #ifdef GLVIEW_VULKAN_ENABLED
@@ -2510,8 +2608,18 @@ int main(int argc, char** argv) {
         std::printf("Vulkan: rendering %zu objects\n", gObjects.size());
 
         // Vulkan render loop
+        double vkLastTime = glfwGetTime();
         while (!glfwWindowShouldClose(window)) {
             glfwPollEvents();
+
+            double vkNow = glfwGetTime();
+            float dt = static_cast<float>(vkNow - vkLastTime);
+            vkLastTime = vkNow;
+            if (gAnimPlaying && animDuration > 0.0f) {
+                gAnimTime += dt;
+                if (gAnimTime > animDuration) gAnimTime -= animDuration;
+                applyAnimToObjects(demoAnim, gAnimTime);
+            }
 
             Mat4 view = gCamera.getViewMatrix();
             float farPlane = objLoaded ? std::max(100.0f, gCamera.distance * 10.0f) : 100.0f;
@@ -2609,10 +2717,25 @@ int main(int argc, char** argv) {
     GLint uLitModel      = glGetUniformLocation(progLit, "uModel");
     GLint uLitVP         = glGetUniformLocation(progLit, "uVP");
     GLint uLitNormMat    = glGetUniformLocation(progLit, "uNormalMatrix");
-    GLint uLitLightDir   = glGetUniformLocation(progLit, "uLightDir");
     GLint uLitCameraPos  = glGetUniformLocation(progLit, "uCameraPos");
-    GLint uLitLightColor = glGetUniformLocation(progLit, "uLightColor");
     GLint uLitAmbient    = glGetUniformLocation(progLit, "uAmbient");
+    GLint uLitNumLights  = glGetUniformLocation(progLit, "uNumLights");
+
+    struct LitLightUniforms {
+        GLint type, direction, position, color, intensity, range, innerCone, outerCone;
+    };
+    LitLightUniforms uLitLights[kMaxLights];
+    for (int i = 0; i < kMaxLights; ++i) {
+        char buf[64];
+        auto loc = [&](const char* field) -> GLint {
+            std::snprintf(buf, sizeof(buf), "uLights[%d].%s", i, field);
+            return glGetUniformLocation(progLit, buf);
+        };
+        uLitLights[i] = {
+            loc("type"), loc("direction"), loc("position"), loc("color"),
+            loc("intensity"), loc("range"), loc("innerCone"), loc("outerCone")
+        };
+    }
 
     // -----------------------------------------------------------------------
     // Upload geometry to GL
@@ -2692,8 +2815,21 @@ int main(int argc, char** argv) {
     tuiInitGL();
     gFpsLastTime = glfwGetTime();
 
-    // Light direction for lit mode
-    Vec3 lightDir = normalize({0.5f, 1.0f, 0.3f});
+    // Scene lights for lit mode
+    struct SceneLight {
+        int type;       // 0=directional, 1=point, 2=spot
+        Vec3 direction;
+        Vec3 position;
+        Vec3 color;
+        float intensity;
+        float range;
+        float innerCone;
+        float outerCone;
+    };
+    std::vector<SceneLight> sceneLights;
+    // Default: key light (directional) + fill light (directional)
+    sceneLights.push_back({0, normalize({0.5f, 1.0f, 0.3f}), {0,0,0}, {1.0f, 1.0f, 0.95f}, 1.0f, 0, 0, 0});
+    sceneLights.push_back({0, normalize({-0.3f, 0.4f, -0.8f}), {0,0,0}, {0.3f, 0.35f, 0.5f}, 0.6f, 0, 0, 0});
 
     glEnable(GL_DEPTH_TEST);
 
@@ -2707,14 +2843,24 @@ int main(int argc, char** argv) {
         termLog("Demo scene (3 cubes)");
     }
     termLog("Controls: 4=Wireframe, 5=Shading, 6=Shading+Tex, 7=Lighting");
-    termLog("  LMB click=Select, F=Fit to selection");
+    termLog("  LMB click=Select, F=Fit to selection, Space=Play/Pause");
     termLog("  Alt+LMB=Orbit, Shift+LMB=Pan, Ctrl+LMB=Dolly, Scroll=Dolly");
 
     // -----------------------------------------------------------------------
     // Render loop
     // -----------------------------------------------------------------------
+    double glLastTime = glfwGetTime();
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
+
+        double glNow = glfwGetTime();
+        float dt = static_cast<float>(glNow - glLastTime);
+        glLastTime = glNow;
+        if (gAnimPlaying && animDuration > 0.0f) {
+            gAnimTime += dt;
+            if (gAnimTime > animDuration) gAnimTime -= animDuration;
+            applyAnimToObjects(demoAnim, gAnimTime);
+        }
 
         Mat4 view = gCamera.getViewMatrix();
         float farPlane = objLoaded ? std::max(100.0f, gCamera.distance * 10.0f) : 100.0f;
@@ -2810,15 +2956,29 @@ int main(int argc, char** argv) {
             }
 
         } else if (gRenderMode == 7) {
-            // Lighting (Blinn-Phong)
+            // Lighting (Blinn-Phong, multi-light)
             glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
             glUseProgram(progLit);
             glUniformMatrix4fv(uLitVP, 1, GL_FALSE, vp.m);
-            glUniform3f(uLitLightDir, lightDir.x, lightDir.y, lightDir.z);
             Vec3 camPos = gCamera.getEyePosition();
             glUniform3f(uLitCameraPos, camPos.x, camPos.y, camPos.z);
-            glUniform3f(uLitLightColor, 1.0f, 1.0f, 1.0f);
             glUniform1f(uLitAmbient, 0.15f);
+
+            int numLights = static_cast<int>(sceneLights.size());
+            if (numLights > kMaxLights) numLights = kMaxLights;
+            glUniform1i(uLitNumLights, numLights);
+            for (int li = 0; li < numLights; ++li) {
+                auto& sl = sceneLights[li];
+                auto& u = uLitLights[li];
+                glUniform1i(u.type, sl.type);
+                glUniform3f(u.direction, sl.direction.x, sl.direction.y, sl.direction.z);
+                glUniform3f(u.position, sl.position.x, sl.position.y, sl.position.z);
+                glUniform3f(u.color, sl.color.x, sl.color.y, sl.color.z);
+                glUniform1f(u.intensity, sl.intensity);
+                glUniform1f(u.range, sl.range);
+                glUniform1f(u.innerCone, sl.innerCone);
+                glUniform1f(u.outerCone, sl.outerCone);
+            }
 
             for (auto& obj : gObjects) {
                 Mat4 model = obj.modelMatrix();

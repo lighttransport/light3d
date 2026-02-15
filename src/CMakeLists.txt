@@ -14,6 +14,8 @@ add_library(light3d
     skinning.cpp
     node_animation.cpp
     timeline.cpp
+    primitives.cpp
+    light_prim.cpp
 )
 
 target_include_directories(light3d PUBLIC
