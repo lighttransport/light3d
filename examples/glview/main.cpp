@@ -8,7 +8,9 @@
 #endif
 
 #include <light3d/light3d.h>
+#include <light3d/obj_loader.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
@@ -340,6 +342,9 @@ static std::vector<SceneObject> gObjects;
 
 // Backend selection
 static bool gUseVulkan = false;
+
+// OBJ file to load (empty = demo scene)
+static std::string gObjFilePath;
 
 #ifdef GLVIEW_OPENGL_ENABLED
 // Pick FBO
@@ -764,6 +769,76 @@ static std::vector<float> buildBBoxWireframeVerts() {
         pushVertexSimple(verts, c[e[1]][0], c[e[1]][1], c[e[1]][2], y, y, 0);
     }
     return verts;
+}
+
+// ---------------------------------------------------------------------------
+// Convert ObjLoadResult to interleaved 11-float triangulated vertex buffer
+// ---------------------------------------------------------------------------
+struct ObjConvertResult {
+    std::vector<float> verts;
+    BBox bbox;
+};
+
+static ObjConvertResult buildVertsFromObjResult(const light3d::ObjLoadResult& obj) {
+    ObjConvertResult result;
+    const auto& geo = obj.geometry;
+
+    int faceStart = 0;
+    for (size_t fi = 0; fi < geo.faceVertexCounts.size(); ++fi) {
+        int fvc = geo.faceVertexCounts[fi];
+
+        // Look up per-face material color
+        float cr = 0.8f, cg = 0.8f, cb = 0.8f;
+        if (fi < geo.faceMaterialIds.size()) {
+            const light3d::Material* mat = obj.materials.getMaterial(geo.faceMaterialIds[fi]);
+            if (mat) {
+                cr = mat->baseColor.x;
+                cg = mat->baseColor.y;
+                cb = mat->baseColor.z;
+            }
+        }
+
+        // Fan-triangulate: vertex 0 is the hub
+        for (int t = 1; t + 1 < fvc; ++t) {
+            int idx[3] = {
+                geo.faceVertexIndices[faceStart],
+                geo.faceVertexIndices[faceStart + t],
+                geo.faceVertexIndices[faceStart + t + 1]
+            };
+
+            // Positions
+            light3d::Vec3 p[3];
+            for (int k = 0; k < 3; ++k) {
+                p[k] = (idx[k] >= 0 && idx[k] < static_cast<int>(geo.points.size()))
+                    ? geo.points[idx[k]] : light3d::Vec3(0, 0, 0);
+            }
+
+            // Normals
+            light3d::Vec3 n[3];
+            for (int k = 0; k < 3; ++k) {
+                n[k] = (idx[k] >= 0 && idx[k] < static_cast<int>(geo.normals.size()))
+                    ? geo.normals[idx[k]] : light3d::Vec3(0, 1, 0);
+            }
+
+            // UVs
+            light3d::Vec3 uv[3];
+            for (int k = 0; k < 3; ++k) {
+                uv[k] = (idx[k] >= 0 && idx[k] < static_cast<int>(geo.uvs.size()))
+                    ? geo.uvs[idx[k]] : light3d::Vec3(0, 0, 0);
+            }
+
+            for (int k = 0; k < 3; ++k) {
+                pushVertex(result.verts,
+                           p[k].x, p[k].y, p[k].z,
+                           cr, cg, cb,
+                           n[k].x, n[k].y, n[k].z,
+                           uv[k].x, uv[k].y);
+                result.bbox.expand({p[k].x, p[k].y, p[k].z});
+            }
+        }
+        faceStart += fvc;
+    }
+    return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -2241,6 +2316,16 @@ int main(int argc, char** argv) {
 #endif
         } else if (std::strcmp(argv[i], "--opengl") == 0) {
             gUseVulkan = false;
+        } else if (std::strcmp(argv[i], "--obj") == 0) {
+            if (i + 1 < argc) {
+                gObjFilePath = argv[++i];
+            } else {
+                std::fprintf(stderr, "--obj requires a file path\n");
+                return EXIT_FAILURE;
+            }
+        } else if (argv[i][0] != '-') {
+            // Positional argument: treat as OBJ file path
+            gObjFilePath = argv[i];
         }
     }
 
@@ -2331,11 +2416,35 @@ int main(int argc, char** argv) {
     cubeBBox.mx = { 0.5f,  0.5f,  0.5f};
 
     // -----------------------------------------------------------------------
+    // OBJ loading (if requested)
+    // -----------------------------------------------------------------------
+    std::vector<float> objVerts;
+    BBox objBBox;
+    bool objLoaded = false;
+
+    if (!gObjFilePath.empty()) {
+        std::printf("Loading OBJ: %s\n", gObjFilePath.c_str());
+        light3d::ObjLoadResult objResult = light3d::loadObj(gObjFilePath);
+        if (objResult.success) {
+            ObjConvertResult conv = buildVertsFromObjResult(objResult);
+            objVerts = std::move(conv.verts);
+            objBBox = conv.bbox;
+            objLoaded = true;
+            std::printf("OBJ loaded: %zu triangles\n",
+                        objVerts.size() / (kVertStride * 3));
+        } else {
+            std::fprintf(stderr, "Failed to load OBJ '%s': %s\n",
+                         gObjFilePath.c_str(), objResult.errorMessage.c_str());
+            std::fprintf(stderr, "Falling back to demo scene\n");
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Vulkan path
     // -----------------------------------------------------------------------
 #ifdef GLVIEW_VULKAN_ENABLED
     VulkanBackend vkBackend;
-    VkMesh vkGrid, vkAxis, vkCube, vkBbox;
+    VkMesh vkGrid, vkAxis, vkCube, vkBbox, vkObjMesh = {};
 
     if (gUseVulkan) {
         gVkBackend = &vkBackend;
@@ -2351,36 +2460,51 @@ int main(int argc, char** argv) {
         vkCube = vkBackend.createMesh(cubeVerts);
         vkBbox = vkBackend.createMesh(bboxVerts);
 
-        // Scene objects
-        {
+        if (objLoaded) {
+            vkObjMesh = vkBackend.createMesh(objVerts);
+
             SceneObject obj;
-            obj.name = "CubeCenter";
+            obj.name = gObjFilePath;
             obj.meshIndex = 0;
-            obj.position = {0, 0.5f, 0};
+            obj.position = {0, 0, 0};
             obj.scl = {1, 1, 1};
-            obj.localBBox = cubeBBox;
+            obj.localBBox = objBBox;
             obj.pickId = 1;
             gObjects.push_back(obj);
-        }
-        {
-            SceneObject obj;
-            obj.name = "CubeRight";
-            obj.meshIndex = 0;
-            obj.position = {3, 0.5f, 0};
-            obj.scl = {1, 1, 1};
-            obj.localBBox = cubeBBox;
-            obj.pickId = 2;
-            gObjects.push_back(obj);
-        }
-        {
-            SceneObject obj;
-            obj.name = "CubeBack";
-            obj.meshIndex = 0;
-            obj.position = {0, 0.5f, -3};
-            obj.scl = {1, 1, 1};
-            obj.localBBox = cubeBBox;
-            obj.pickId = 3;
-            gObjects.push_back(obj);
+
+            fitCameraToAll();
+        } else {
+            // Demo scene: 3 cubes
+            {
+                SceneObject obj;
+                obj.name = "CubeCenter";
+                obj.meshIndex = 0;
+                obj.position = {0, 0.5f, 0};
+                obj.scl = {1, 1, 1};
+                obj.localBBox = cubeBBox;
+                obj.pickId = 1;
+                gObjects.push_back(obj);
+            }
+            {
+                SceneObject obj;
+                obj.name = "CubeRight";
+                obj.meshIndex = 0;
+                obj.position = {3, 0.5f, 0};
+                obj.scl = {1, 1, 1};
+                obj.localBBox = cubeBBox;
+                obj.pickId = 2;
+                gObjects.push_back(obj);
+            }
+            {
+                SceneObject obj;
+                obj.name = "CubeBack";
+                obj.meshIndex = 0;
+                obj.position = {0, 0.5f, -3};
+                obj.scl = {1, 1, 1};
+                obj.localBBox = cubeBBox;
+                obj.pickId = 3;
+                gObjects.push_back(obj);
+            }
         }
 
         std::printf("Vulkan: rendering %zu objects\n", gObjects.size());
@@ -2390,7 +2514,8 @@ int main(int argc, char** argv) {
             glfwPollEvents();
 
             Mat4 view = gCamera.getViewMatrix();
-            Mat4 proj = perspectiveVk(45.0f, gAspect, 0.1f, 100.0f);
+            float farPlane = objLoaded ? std::max(100.0f, gCamera.distance * 10.0f) : 100.0f;
+            Mat4 proj = perspectiveVk(45.0f, gAspect, 0.1f, farPlane);
             Mat4 vp = proj * view;
             Mat4 identity = Mat4::identity();
 
@@ -2403,7 +2528,8 @@ int main(int argc, char** argv) {
             // Scene objects (triangles)
             for (auto& obj : gObjects) {
                 Mat4 model = obj.modelMatrix();
-                vkBackend.draw(vkCube, model.m, vp.m, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
+                VkMesh& drawMesh = objLoaded ? vkObjMesh : vkCube;
+                vkBackend.draw(drawMesh, model.m, vp.m, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
             }
 
             // Selection wireframe bbox
@@ -2424,6 +2550,7 @@ int main(int argc, char** argv) {
         vkBackend.destroyMesh(vkAxis);
         vkBackend.destroyMesh(vkCube);
         vkBackend.destroyMesh(vkBbox);
+        if (objLoaded) vkBackend.destroyMesh(vkObjMesh);
         vkBackend.cleanup();
         gVkBackend = nullptr;
 
@@ -2495,38 +2622,58 @@ int main(int argc, char** argv) {
     Mesh cubeMesh = createMesh(cubeVerts);
     Mesh bboxWire = createMesh(bboxVerts);
 
+    // OBJ mesh — declared at main() scope so the pointer stays valid
+    Mesh objMesh = {};
+    if (objLoaded) {
+        objMesh = createMesh(objVerts);
+    }
+
     // -----------------------------------------------------------------------
-    // Scene objects (3 cubes sharing the same mesh)
+    // Scene objects
     // -----------------------------------------------------------------------
-    {
+    if (objLoaded) {
         SceneObject obj;
-        obj.name = "CubeCenter";
-        obj.mesh = &cubeMesh;
-        obj.position = {0, 0.5f, 0};
+        obj.name = gObjFilePath;
+        obj.mesh = &objMesh;
+        obj.position = {0, 0, 0};
         obj.scl = {1, 1, 1};
-        obj.localBBox = cubeBBox;
+        obj.localBBox = objBBox;
         obj.pickId = 1;
         gObjects.push_back(obj);
-    }
-    {
-        SceneObject obj;
-        obj.name = "CubeRight";
-        obj.mesh = &cubeMesh;
-        obj.position = {3, 0.5f, 0};
-        obj.scl = {1, 1, 1};
-        obj.localBBox = cubeBBox;
-        obj.pickId = 2;
-        gObjects.push_back(obj);
-    }
-    {
-        SceneObject obj;
-        obj.name = "CubeBack";
-        obj.mesh = &cubeMesh;
-        obj.position = {0, 0.5f, -3};
-        obj.scl = {1, 1, 1};
-        obj.localBBox = cubeBBox;
-        obj.pickId = 3;
-        gObjects.push_back(obj);
+
+        fitCameraToAll();
+    } else {
+        // Demo scene: 3 cubes sharing the same mesh
+        {
+            SceneObject obj;
+            obj.name = "CubeCenter";
+            obj.mesh = &cubeMesh;
+            obj.position = {0, 0.5f, 0};
+            obj.scl = {1, 1, 1};
+            obj.localBBox = cubeBBox;
+            obj.pickId = 1;
+            gObjects.push_back(obj);
+        }
+        {
+            SceneObject obj;
+            obj.name = "CubeRight";
+            obj.mesh = &cubeMesh;
+            obj.position = {3, 0.5f, 0};
+            obj.scl = {1, 1, 1};
+            obj.localBBox = cubeBBox;
+            obj.pickId = 2;
+            gObjects.push_back(obj);
+        }
+        {
+            SceneObject obj;
+            obj.name = "CubeBack";
+            obj.mesh = &cubeMesh;
+            obj.position = {0, 0.5f, -3};
+            obj.scl = {1, 1, 1};
+            obj.localBBox = cubeBBox;
+            obj.pickId = 3;
+            gObjects.push_back(obj);
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -2553,6 +2700,12 @@ int main(int argc, char** argv) {
     termLog("Light3D v%s - OpenGL viewer example",
             light3d::getVersionString().c_str());
     termLog("%s", glInfoStr.c_str());
+    if (objLoaded) {
+        termLog("Loaded: %s (%zu tris)", gObjFilePath.c_str(),
+                objVerts.size() / (kVertStride * 3));
+    } else {
+        termLog("Demo scene (3 cubes)");
+    }
     termLog("Controls: 4=Wireframe, 5=Shading, 6=Shading+Tex, 7=Lighting");
     termLog("  LMB click=Select, F=Fit to selection");
     termLog("  Alt+LMB=Orbit, Shift+LMB=Pan, Ctrl+LMB=Dolly, Scroll=Dolly");
@@ -2564,7 +2717,8 @@ int main(int argc, char** argv) {
         glfwPollEvents();
 
         Mat4 view = gCamera.getViewMatrix();
-        Mat4 proj = perspective(45.0f, gAspect, 0.1f, 100.0f);
+        float farPlane = objLoaded ? std::max(100.0f, gCamera.distance * 10.0f) : 100.0f;
+        Mat4 proj = perspective(45.0f, gAspect, 0.1f, farPlane);
         Mat4 vp = proj * view;
 
         // Handle pending click (picking)
@@ -2714,6 +2868,7 @@ int main(int argc, char** argv) {
     destroyMesh(axis);
     destroyMesh(cubeMesh);  // shared by all 3 objects, destroy once
     destroyMesh(bboxWire);
+    if (objLoaded) destroyMesh(objMesh);
 
     glDeleteProgram(progColor);
     glDeleteProgram(progTextured);
