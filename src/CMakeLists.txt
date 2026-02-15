@@ -8,6 +8,8 @@ add_library(light3d
     mesh_data.cpp
     skeleton.cpp
     skel_animation.cpp
+    skinning.cpp
+    node_animation.cpp
     timeline.cpp
 )
 

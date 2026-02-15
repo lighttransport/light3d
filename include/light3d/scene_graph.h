@@ -9,4 +9,6 @@
 #include "mesh_data.h"
 #include "skeleton.h"
 #include "skel_animation.h"
+#include "skinning.h"
+#include "node_animation.h"
 #include "timeline.h"
