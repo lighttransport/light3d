@@ -32,6 +32,12 @@ struct Material {
     float alphaCutoff = 0.5f;
 
     bool doubleSided = false;
+
+    // Texture indices into TextureLibrary (-1 = no texture)
+    int baseColorTexture = -1;
+    int metallicRoughnessTexture = -1;
+    int normalTexture = -1;
+    int emissiveTexture = -1;
 };
 
 // --- Material Library ---
@@ -76,11 +82,12 @@ SubmeshData buildSubmeshes(const MeshGeometry& geometry);
 
 // --- Bindless Approach (GL4.3+ / Vulkan) ---
 
-// GPU-packed material: 3 x vec4 = 12 floats per material (std430 aligned)
+// GPU-packed material: 4 x vec4 = 16 floats per material (std430 aligned)
 //   vec4(baseColor.rgb, metallic)
 //   vec4(emissive.rgb, roughness)
 //   vec4(alpha, alphaCutoff, doubleSided, 0)
-constexpr int kPackedMaterialFloats = 12;
+//   vec4(baseColorTexIdx, metalRoughTexIdx, normalTexIdx, emissiveTexIdx)
+constexpr int kPackedMaterialFloats = 16;
 
 std::vector<float> packMaterialsToBuffer(const MaterialLibrary& library);
 

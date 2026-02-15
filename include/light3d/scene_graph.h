@@ -8,6 +8,8 @@
 #include "stage.h"
 #include "mesh_data.h"
 #include "material.h"
+#include "texture.h"
+#include "obj_loader.h"
 #include "skeleton.h"
 #include "skel_animation.h"
 #include "skinning.h"

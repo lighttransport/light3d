@@ -7,6 +7,8 @@ add_library(light3d
     stage.cpp
     mesh_data.cpp
     material.cpp
+    texture.cpp
+    obj_loader.cpp
     skeleton.cpp
     skel_animation.cpp
     skinning.cpp
@@ -16,6 +18,7 @@ add_library(light3d
 
 target_include_directories(light3d PUBLIC
     ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/deps
 )
 
 target_compile_features(light3d PUBLIC cxx_std_17)

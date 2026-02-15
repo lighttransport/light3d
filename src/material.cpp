@@ -140,6 +140,12 @@ std::vector<float> packMaterialsToBuffer(const MaterialLibrary& library) {
         buf.push_back(mat.alphaCutoff);
         buf.push_back(mat.doubleSided ? 1.0f : 0.0f);
         buf.push_back(0.0f);
+
+        // vec4(baseColorTexIdx, metalRoughTexIdx, normalTexIdx, emissiveTexIdx)
+        buf.push_back(static_cast<float>(mat.baseColorTexture));
+        buf.push_back(static_cast<float>(mat.metallicRoughnessTexture));
+        buf.push_back(static_cast<float>(mat.normalTexture));
+        buf.push_back(static_cast<float>(mat.emissiveTexture));
     }
 
     return buf;
@@ -179,6 +185,7 @@ const char* getMaterialVertexShaderGL330() {
 
 layout(location = 0) in vec3 aPosition;
 layout(location = 1) in vec3 aNormal;
+layout(location = 2) in vec3 aUV;
 
 uniform mat4 uModelViewProj;
 uniform mat4 uModel;
@@ -186,11 +193,13 @@ uniform mat3 uNormalMatrix;
 
 out vec3 vWorldPos;
 out vec3 vNormal;
+out vec2 vUV;
 
 void main() {
     vec4 worldPos = uModel * vec4(aPosition, 1.0);
     vWorldPos = worldPos.xyz;
     vNormal = normalize(uNormalMatrix * aNormal);
+    vUV = aUV.xy;
     gl_Position = uModelViewProj * vec4(aPosition, 1.0);
 }
 )glsl";
@@ -201,6 +210,7 @@ const char* getMaterialFragmentShaderGL330() {
 
 in vec3 vWorldPos;
 in vec3 vNormal;
+in vec2 vUV;
 
 // Material uniforms (one draw call per submesh)
 uniform vec3 uBaseColor;
@@ -211,10 +221,42 @@ uniform float uAlpha;
 
 uniform vec3 uCameraPos;
 
+// Texture samplers
+uniform sampler2D uBaseColorTex;
+uniform bool uHasBaseColorTex;
+uniform sampler2D uMetalRoughTex;
+uniform bool uHasMetalRoughTex;
+uniform sampler2D uNormalTex;
+uniform bool uHasNormalTex;
+uniform sampler2D uEmissiveTex;
+uniform bool uHasEmissiveTex;
+
 out vec4 fragColor;
 
 void main() {
+    vec3 baseColor = uBaseColor;
+    float metallic = uMetallic;
+    float roughness = uRoughness;
+    vec3 emissive = uEmissive;
+
+    if (uHasBaseColorTex) {
+        baseColor *= texture(uBaseColorTex, vUV).rgb;
+    }
+    if (uHasMetalRoughTex) {
+        vec4 mr = texture(uMetalRoughTex, vUV);
+        roughness *= mr.g;
+        metallic *= mr.b;
+    }
+    if (uHasEmissiveTex) {
+        emissive *= texture(uEmissiveTex, vUV).rgb;
+    }
+
     vec3 N = normalize(vNormal);
+    if (uHasNormalTex) {
+        vec3 tangentNormal = texture(uNormalTex, vUV).xyz * 2.0 - 1.0;
+        N = normalize(N + tangentNormal * 0.1);
+    }
+
     vec3 V = normalize(uCameraPos - vWorldPos);
 
     // Simple directional light
@@ -222,18 +264,18 @@ void main() {
     float NdotL = max(dot(N, L), 0.0);
 
     // Simple PBR-ish shading
-    vec3 diffuse = uBaseColor * (1.0 - uMetallic) * NdotL;
+    vec3 diffuse = baseColor * (1.0 - metallic) * NdotL;
 
     vec3 H = normalize(L + V);
     float NdotH = max(dot(N, H), 0.0);
-    float specPower = mix(16.0, 256.0, 1.0 - uRoughness);
-    vec3 specColor = mix(vec3(0.04), uBaseColor, uMetallic);
+    float specPower = mix(16.0, 256.0, 1.0 - roughness);
+    vec3 specColor = mix(vec3(0.04), baseColor, metallic);
     vec3 specular = specColor * pow(NdotH, specPower);
 
     // Ambient
-    vec3 ambient = uBaseColor * 0.05;
+    vec3 ambient = baseColor * 0.05;
 
-    vec3 color = ambient + diffuse + specular + uEmissive;
+    vec3 color = ambient + diffuse + specular + emissive;
     fragColor = vec4(color, uAlpha);
 }
 )glsl";
@@ -246,6 +288,7 @@ const char* getMaterialVertexShaderGL430() {
 
 layout(location = 0) in vec3 aPosition;
 layout(location = 1) in vec3 aNormal;
+layout(location = 2) in vec3 aUV;
 
 uniform mat4 uModelViewProj;
 uniform mat4 uModel;
@@ -253,11 +296,13 @@ uniform mat3 uNormalMatrix;
 
 out vec3 vWorldPos;
 out vec3 vNormal;
+out vec2 vUV;
 
 void main() {
     vec4 worldPos = uModel * vec4(aPosition, 1.0);
     vWorldPos = worldPos.xyz;
     vNormal = normalize(uNormalMatrix * aNormal);
+    vUV = aUV.xy;
     gl_Position = uModelViewProj * vec4(aPosition, 1.0);
 }
 )glsl";
@@ -268,8 +313,9 @@ const char* getMaterialFragmentShaderGL430() {
 
 in vec3 vWorldPos;
 in vec3 vNormal;
+in vec2 vUV;
 
-// Materials SSBO: each material is 3 x vec4 (12 floats)
+// Materials SSBO: each material is 4 x vec4 (16 floats)
 layout(std430, binding = 1) readonly buffer Materials {
     vec4 materials[];
 };
@@ -280,12 +326,13 @@ layout(std430, binding = 2) readonly buffer FaceMaterialIds {
 };
 
 uniform vec3 uCameraPos;
+uniform sampler2DArray uTextureArray;
 
 out vec4 fragColor;
 
 void main() {
     int matId = int(faceMaterialId[gl_PrimitiveID]);
-    int base = matId * 3;
+    int base = matId * 4;
 
     vec3 baseColor = materials[base + 0].xyz;
     float metallic = materials[base + 0].w;
@@ -293,7 +340,30 @@ void main() {
     float roughness = materials[base + 1].w;
     float alpha     = materials[base + 2].x;
 
+    // Texture indices from 4th vec4
+    float baseColorTexIdx  = materials[base + 3].x;
+    float metalRoughTexIdx = materials[base + 3].y;
+    float normalTexIdx     = materials[base + 3].z;
+    float emissiveTexIdx   = materials[base + 3].w;
+
+    if (baseColorTexIdx >= 0.0) {
+        baseColor *= texture(uTextureArray, vec3(vUV, baseColorTexIdx)).rgb;
+    }
+    if (metalRoughTexIdx >= 0.0) {
+        vec4 mr = texture(uTextureArray, vec3(vUV, metalRoughTexIdx));
+        roughness *= mr.g;
+        metallic *= mr.b;
+    }
+    if (emissiveTexIdx >= 0.0) {
+        emissive *= texture(uTextureArray, vec3(vUV, emissiveTexIdx)).rgb;
+    }
+
     vec3 N = normalize(vNormal);
+    if (normalTexIdx >= 0.0) {
+        vec3 tangentNormal = texture(uTextureArray, vec3(vUV, normalTexIdx)).xyz * 2.0 - 1.0;
+        N = normalize(N + tangentNormal * 0.1);
+    }
+
     vec3 V = normalize(uCameraPos - vWorldPos);
 
     // Simple directional light
@@ -325,6 +395,7 @@ const char* getMaterialVertexShaderVK450() {
 
 layout(location = 0) in vec3 aPosition;
 layout(location = 1) in vec3 aNormal;
+layout(location = 2) in vec3 aUV;
 
 layout(push_constant) uniform PushConstants {
     mat4 modelViewProj;
@@ -333,12 +404,14 @@ layout(push_constant) uniform PushConstants {
 
 layout(location = 0) out vec3 vWorldPos;
 layout(location = 1) out vec3 vNormal;
+layout(location = 2) out vec2 vUV;
 
 void main() {
     vec4 worldPos = pc.model * vec4(aPosition, 1.0);
     vWorldPos = worldPos.xyz;
     // Approximate normal matrix (works for uniform scale)
     vNormal = normalize(mat3(pc.model) * aNormal);
+    vUV = aUV.xy;
     gl_Position = pc.modelViewProj * vec4(aPosition, 1.0);
 }
 )glsl";
@@ -349,8 +422,9 @@ const char* getMaterialFragmentShaderVK450() {
 
 layout(location = 0) in vec3 vWorldPos;
 layout(location = 1) in vec3 vNormal;
+layout(location = 2) in vec2 vUV;
 
-// Materials SSBO: each material is 3 x vec4 (12 floats)
+// Materials SSBO: each material is 4 x vec4 (16 floats)
 layout(set = 0, binding = 1) readonly buffer Materials {
     vec4 materials[];
 };
@@ -364,11 +438,13 @@ layout(set = 0, binding = 0) uniform SceneUBO {
     vec3 cameraPos;
 };
 
+layout(set = 0, binding = 3) uniform sampler2DArray uTextureArray;
+
 layout(location = 0) out vec4 fragColor;
 
 void main() {
     int matId = int(faceMaterialId[gl_PrimitiveID]);
-    int base = matId * 3;
+    int base = matId * 4;
 
     vec3 baseColor = materials[base + 0].xyz;
     float metallic = materials[base + 0].w;
@@ -376,7 +452,30 @@ void main() {
     float roughness = materials[base + 1].w;
     float alpha     = materials[base + 2].x;
 
+    // Texture indices from 4th vec4
+    float baseColorTexIdx  = materials[base + 3].x;
+    float metalRoughTexIdx = materials[base + 3].y;
+    float normalTexIdx     = materials[base + 3].z;
+    float emissiveTexIdx   = materials[base + 3].w;
+
+    if (baseColorTexIdx >= 0.0) {
+        baseColor *= texture(uTextureArray, vec3(vUV, baseColorTexIdx)).rgb;
+    }
+    if (metalRoughTexIdx >= 0.0) {
+        vec4 mr = texture(uTextureArray, vec3(vUV, metalRoughTexIdx));
+        roughness *= mr.g;
+        metallic *= mr.b;
+    }
+    if (emissiveTexIdx >= 0.0) {
+        emissive *= texture(uTextureArray, vec3(vUV, emissiveTexIdx)).rgb;
+    }
+
     vec3 N = normalize(vNormal);
+    if (normalTexIdx >= 0.0) {
+        vec3 tangentNormal = texture(uTextureArray, vec3(vUV, normalTexIdx)).xyz * 2.0 - 1.0;
+        N = normalize(N + tangentNormal * 0.1);
+    }
+
     vec3 V = normalize(cameraPos - vWorldPos);
 
     // Simple directional light
