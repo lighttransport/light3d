@@ -16,6 +16,7 @@ add_library(light3d
     timeline.cpp
     primitives.cpp
     light_prim.cpp
+    camera.cpp
 )
 
 target_include_directories(light3d PUBLIC

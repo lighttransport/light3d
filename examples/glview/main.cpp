@@ -8,6 +8,7 @@
 #endif
 
 #include <light3d/light3d.h>
+#include <light3d/camera.h>
 #include <light3d/node_animation.h>
 #include <light3d/obj_loader.h>
 
@@ -335,8 +336,19 @@ static double gClickPressX = 0, gClickPressY = 0;
 static bool gPendingClick = false;
 static double gPendingClickX = 0, gPendingClickY = 0;
 
-// Render mode: 4=wireframe, 5=shading(default), 6=shading+texture, 7=lighting
+// Render mode: 4=wireframe, 5=shading, 6=shading+texture, 7=lighting,
+//   8=AOV:Normal, 9=AOV:UV, 10=AOV:Depth, 11=AOV:MatID, 0=AOV:Tangent
 static int gRenderMode = 5;
+
+// Frustum culling counters
+static int gRenderedCount = 0;
+static int gTotalCount = 0;
+
+// Viewport layout
+enum class ViewportLayout { Single, SplitH, Quad };
+static ViewportLayout gViewportLayout = ViewportLayout::Single;
+static int gActiveViewport = 0;
+static OrbitCamera gCameras[4];
 
 // Scene objects
 static std::vector<SceneObject> gObjects;
@@ -555,6 +567,126 @@ uniform vec3 uPickColor;
 
 void main() {
     FragColor = vec4(uPickColor, 1.0);
+}
+)";
+
+// --- Shared AOV vertex shader (modes 8-11, 0) ---
+static const char* kAovVS = R"(
+#version 330 core
+layout (location = 0) in vec3 aPos;
+layout (location = 1) in vec3 aColor;
+layout (location = 2) in vec3 aNormal;
+layout (location = 3) in vec2 aUV;
+
+out vec3 vWorldPos;
+out vec3 vNormal;
+out vec2 vUV;
+out vec3 vColor;
+
+uniform mat4 uModel;
+uniform mat4 uVP;
+uniform mat3 uNormalMatrix;
+
+void main() {
+    vec4 worldPos = uModel * vec4(aPos, 1.0);
+    gl_Position = uVP * worldPos;
+    vWorldPos = worldPos.xyz;
+    vNormal = uNormalMatrix * aNormal;
+    vUV = aUV;
+    vColor = aColor;
+}
+)";
+
+// --- AOV: Normal (mode 8) ---
+static const char* kAovNormalFS = R"(
+#version 330 core
+in vec3 vNormal;
+out vec4 FragColor;
+
+void main() {
+    vec3 N = normalize(vNormal);
+    FragColor = vec4(N * 0.5 + 0.5, 1.0);
+}
+)";
+
+// --- AOV: UV (mode 9) ---
+static const char* kAovUvFS = R"(
+#version 330 core
+in vec2 vUV;
+out vec4 FragColor;
+
+void main() {
+    FragColor = vec4(fract(vUV), 0.0, 1.0);
+}
+)";
+
+// --- AOV: Depth (mode 10) ---
+static const char* kAovDepthFS = R"(
+#version 330 core
+out vec4 FragColor;
+
+uniform float uNearPlane;
+uniform float uFarPlane;
+
+void main() {
+    float ndc = gl_FragCoord.z * 2.0 - 1.0;
+    float linearZ = (2.0 * uNearPlane * uFarPlane) / (uFarPlane + uNearPlane - ndc * (uFarPlane - uNearPlane));
+    float val = 1.0 - clamp((linearZ - uNearPlane) / (uFarPlane - uNearPlane), 0.0, 1.0);
+    FragColor = vec4(val, val, val, 1.0);
+}
+)";
+
+// --- AOV: MatID (mode 11) ---
+static const char* kAovMatIdFS = R"(
+#version 330 core
+in vec3 vColor;
+out vec4 FragColor;
+
+void main() {
+    // Hash vertex color into distinct hue
+    float h = fract(dot(vColor, vec3(12.9898, 78.233, 37.719)));
+    // HSV to RGB (S=0.8, V=0.9)
+    float s = 0.8;
+    float v = 0.9;
+    float c = v * s;
+    float hh = h * 6.0;
+    float x = c * (1.0 - abs(mod(hh, 2.0) - 1.0));
+    vec3 rgb;
+    if      (hh < 1.0) rgb = vec3(c, x, 0.0);
+    else if (hh < 2.0) rgb = vec3(x, c, 0.0);
+    else if (hh < 3.0) rgb = vec3(0.0, c, x);
+    else if (hh < 4.0) rgb = vec3(0.0, x, c);
+    else if (hh < 5.0) rgb = vec3(x, 0.0, c);
+    else               rgb = vec3(c, 0.0, x);
+    rgb += v - c;
+    FragColor = vec4(rgb, 1.0);
+}
+)";
+
+// --- AOV: Tangent (mode 0) ---
+static const char* kAovTangentFS = R"(
+#version 330 core
+in vec3 vWorldPos;
+in vec3 vNormal;
+in vec2 vUV;
+out vec4 FragColor;
+
+void main() {
+    // Lengyel's method: compute tangent from screen-space derivatives
+    vec3 dPdx = dFdx(vWorldPos);
+    vec3 dPdy = dFdy(vWorldPos);
+    vec2 dUVdx = dFdx(vUV);
+    vec2 dUVdy = dFdy(vUV);
+
+    float det = dUVdx.x * dUVdy.y - dUVdx.y * dUVdy.x;
+    vec3 T;
+    if (abs(det) > 1e-6) {
+        float invDet = 1.0 / det;
+        T = normalize((dPdx * dUVdy.y - dPdy * dUVdx.y) * invDet);
+    } else {
+        T = normalize(dPdx);
+    }
+    FragColor = vec4(T * 0.5 + 0.5, 1.0);
 }
 )";
 
@@ -1575,10 +1707,15 @@ static void tuiCompose() {
     // Render mode name
     const char* modeName = "Unknown";
     switch (gRenderMode) {
-        case 4: modeName = "Wireframe"; break;
-        case 5: modeName = "Shading"; break;
-        case 6: modeName = "Shading+Tex"; break;
-        case 7: modeName = "Lighting"; break;
+        case 0:  modeName = "AOV:Tangent"; break;
+        case 4:  modeName = "Wireframe"; break;
+        case 5:  modeName = "Shading"; break;
+        case 6:  modeName = "Shading+Tex"; break;
+        case 7:  modeName = "Lighting"; break;
+        case 8:  modeName = "AOV:Normal"; break;
+        case 9:  modeName = "AOV:UV"; break;
+        case 10: modeName = "AOV:Depth"; break;
+        case 11: modeName = "AOV:MatID"; break;
     }
 
     // --- Status bar (row 0) ---
@@ -1586,6 +1723,14 @@ static void tuiCompose() {
     tuiFillRect(0, 0, gTuiCols, 1);
     tuiPrintf(1, 0, "FPS: %.0f", gFpsDisplay);
     tuiPrint(14, 0, modeName);
+
+    // Frustum cull counter
+    {
+        char objBuf[32];
+        snprintf(objBuf, sizeof(objBuf), "Obj: %d/%d", gRenderedCount, gTotalCount);
+        int modeLen = static_cast<int>(strlen(modeName));
+        tuiPrint(14 + modeLen + 2, 0, objBuf);
+    }
 
     if (selObj) {
         // Truncate name if needed
@@ -1606,7 +1751,7 @@ static void tuiCompose() {
     if (gCmdInputActive)
         tuiPrint(1, gTuiRows - 1, "ESC:Cancel  Enter:Submit  Backspace:Delete");
     else
-        tuiPrint(1, gTuiRows - 1, "/:Command  I:Inspector  4-7:Mode  A:FitAll  F:FitSel  ESC:Quit");
+        tuiPrint(1, gTuiRows - 1, "/:Cmd I:Insp 4-9,0:Mode V:Viewport A:FitAll F:FitSel ESC:Quit");
 
     // --- Inspector panel (right side) ---
     if (gShowInspector && selObj) {
@@ -2010,11 +2155,13 @@ static void fitCameraToAll() {
         fitBox.expand(wb.mx);
     }
 
-    gCamera.target = fitBox.center();
+    OrbitCamera& cam = gCameras[gActiveViewport];
+    cam.target = fitBox.center();
     float rad = fitBox.radius();
     if (rad < 0.01f) rad = 1.0f;
     float fovRad = 45.0f * (3.14159265f / 180.0f);
-    gCamera.distance = rad / (0.8f * std::tan(fovRad * 0.5f));
+    cam.distance = rad / (0.8f * std::tan(fovRad * 0.5f));
+    gCamera = cam;
 }
 
 static void fitCameraToSelection() {
@@ -2035,11 +2182,13 @@ static void fitCameraToSelection() {
         return;
     }
 
-    gCamera.target = fitBox.center();
+    OrbitCamera& cam = gCameras[gActiveViewport];
+    cam.target = fitBox.center();
     float rad = fitBox.radius();
     if (rad < 0.01f) rad = 1.0f;
     float fovRad = 45.0f * (3.14159265f / 180.0f);
-    gCamera.distance = rad / (0.8f * std::tan(fovRad * 0.5f));
+    cam.distance = rad / (0.8f * std::tan(fovRad * 0.5f));
+    gCamera = cam;
 }
 
 // ---------------------------------------------------------------------------
@@ -2050,7 +2199,7 @@ static void framebufferSizeCb(GLFWwindow* /*window*/, int width, int height) {
     gAspect = static_cast<float>(width) / static_cast<float>(height);
 #ifdef GLVIEW_OPENGL_ENABLED
     if (!gUseVulkan) {
-        glViewport(0, 0, width, height);
+        // Don't set glViewport here — the viewport loop handles it per-viewport
         tuiResize(width, height);
     }
 #endif
@@ -2086,12 +2235,19 @@ static void executeCommand(const std::string& cmd) {
         gTermHead = 0;
         gTermCount = 0;
     } else if (verb == "mode") {
-        if (arg.size() == 1 && arg[0] >= '4' && arg[0] <= '7') {
-            gRenderMode = arg[0] - '0';
-            const char* names[] = {"Wireframe", "Shading", "Shading+Texture", "Lighting"};
-            termLog("Render mode: %s (%d)", names[gRenderMode - 4], gRenderMode);
+        int modeVal = -1;
+        if (arg.size() == 1 && arg[0] >= '0' && arg[0] <= '9')
+            modeVal = arg[0] - '0';
+        else if (arg == "10") modeVal = 10;
+        else if (arg == "11") modeVal = 11;
+
+        if (modeVal == 0 || (modeVal >= 4 && modeVal <= 11)) {
+            gRenderMode = modeVal;
+            const char* names[] = {"AOV:Tangent","","","","Wireframe","Shading",
+                "Shading+Texture","Lighting","AOV:Normal","AOV:UV","AOV:Depth","AOV:MatID"};
+            termLog("Render mode: %s (%d)", names[gRenderMode], gRenderMode);
         } else {
-            termLog("Usage: mode <4-7>");
+            termLog("Usage: mode <0|4-11>");
         }
     } else if (verb == "fit") {
         if (arg.empty() || arg == "all") {
@@ -2106,7 +2262,7 @@ static void executeCommand(const std::string& cmd) {
     } else if (verb == "help") {
         termLog("Commands:");
         termLog("  clear       - Clear terminal");
-        termLog("  mode <4-7>  - Set render mode");
+        termLog("  mode <0|4-11> - Set render mode");
         termLog("  fit [all]   - Fit camera to all");
         termLog("  fit sel     - Fit camera to selection");
         termLog("  help        - Show this help");
@@ -2226,6 +2382,9 @@ static void keyCb(GLFWwindow* window, int key, int /*scancode*/, int action,
     if (key == GLFW_KEY_5) gRenderMode = 5;
     if (key == GLFW_KEY_6) gRenderMode = 6;
     if (key == GLFW_KEY_7) gRenderMode = 7;
+    if (key == GLFW_KEY_8) gRenderMode = 8;
+    if (key == GLFW_KEY_9) gRenderMode = 9;
+    if (key == GLFW_KEY_0) gRenderMode = 10;
 
     if (key == GLFW_KEY_A) fitCameraToAll();
     if (key == GLFW_KEY_F) fitCameraToSelection();
@@ -2234,12 +2393,28 @@ static void keyCb(GLFWwindow* window, int key, int /*scancode*/, int action,
         gAnimPlaying = !gAnimPlaying;
         termLog("Animation: %s", gAnimPlaying ? "playing" : "paused");
     }
+    if (key == GLFW_KEY_V) {
+        if (gViewportLayout == ViewportLayout::Single)
+            gViewportLayout = ViewportLayout::SplitH;
+        else if (gViewportLayout == ViewportLayout::SplitH)
+            gViewportLayout = ViewportLayout::Quad;
+        else
+            gViewportLayout = ViewportLayout::Single;
+        gActiveViewport = 0;
+        const char* layoutNames[] = {"Single", "SplitH", "Quad"};
+        termLog("Viewport: %s", layoutNames[static_cast<int>(gViewportLayout)]);
+    }
 
-    if (key >= GLFW_KEY_4 && key <= GLFW_KEY_7) {
-        const char* names[] = {"", "", "", "", "Wireframe", "Shading", "Shading+Texture", "Lighting"};
-        termLog("Render mode: %s (%d)", names[key - GLFW_KEY_0], gRenderMode);
+    if ((key >= GLFW_KEY_4 && key <= GLFW_KEY_9) || key == GLFW_KEY_0) {
+        const char* names[] = {"AOV:Depth","","","","Wireframe","Shading",
+            "Shading+Texture","Lighting","AOV:Normal","AOV:UV"};
+        int idx = key - GLFW_KEY_0;
+        if (idx >= 0 && idx <= 9)
+            termLog("Render mode: %s (%d)", names[idx], gRenderMode);
     }
 }
+
+static int hitTestViewport(double cx, double cy, int fbW, int fbH);
 
 static void mouseButtonCb(GLFWwindow* window, int button, int action,
                            int mods) {
@@ -2254,6 +2429,17 @@ static void mouseButtonCb(GLFWwindow* window, int button, int action,
     if (action == GLFW_PRESS) {
         gLastCursorX = cx;
         gLastCursorY = cy;
+        // Determine which viewport was clicked
+        {
+            int fbW, fbH;
+            glfwGetFramebufferSize(window, &fbW, &fbH);
+            int winW2, winH2;
+            glfwGetWindowSize(window, &winW2, &winH2);
+            float fbScaleX = (winW2 > 0) ? static_cast<float>(fbW) / static_cast<float>(winW2) : 1.0f;
+            float fbScaleY = (winH2 > 0) ? static_cast<float>(fbH) / static_cast<float>(winH2) : 1.0f;
+            gActiveViewport = hitTestViewport(cx * fbScaleX, cy * fbScaleY, fbW, fbH);
+            gCamera = gCameras[gActiveViewport];
+        }
         if (button == GLFW_MOUSE_BUTTON_LEFT) {
             gLmbDown = true;
             gClickPressX = cx;
@@ -2305,17 +2491,32 @@ static void mouseButtonCb(GLFWwindow* window, int button, int action,
 }
 
 static void doPan(float dx, float dy) {
+    OrbitCamera& cam = gCameras[gActiveViewport];
     Vec3 right, up;
-    gCamera.getLocalAxes(right, up);
-    float panSpeed = gCamera.distance * 0.002f;
-    gCamera.target = gCamera.target -
-                     right * (dx * panSpeed) +
-                     up * (dy * panSpeed);
+    cam.getLocalAxes(right, up);
+    float panSpeed = cam.distance * 0.002f;
+    cam.target = cam.target -
+                 right * (dx * panSpeed) +
+                 up * (dy * panSpeed);
+    gCamera = cam;
 }
 
 static void doDolly(float dy) {
-    gCamera.distance += dy * 0.02f * gCamera.distance;
-    if (gCamera.distance < 0.1f) gCamera.distance = 0.1f;
+    OrbitCamera& cam = gCameras[gActiveViewport];
+    cam.distance += dy * 0.02f * cam.distance;
+    if (cam.distance < 0.1f) cam.distance = 0.1f;
+    gCamera = cam;
+}
+
+static int hitTestViewport(double cx, double cy, int fbW, int fbH) {
+    if (gViewportLayout == ViewportLayout::Single) return 0;
+    if (gViewportLayout == ViewportLayout::SplitH) {
+        return (cx < fbW * 0.5) ? 0 : 1;
+    }
+    // Quad
+    int col = (cx < fbW * 0.5) ? 0 : 1;
+    int row = (cy < fbH * 0.5) ? 0 : 1;
+    return row * 2 + col;
 }
 
 static void cursorPosCb(GLFWwindow* window, double xpos, double ypos) {
@@ -2333,22 +2534,24 @@ static void cursorPosCb(GLFWwindow* window, double xpos, double ypos) {
                              glfwGetKey(window, GLFW_KEY_RIGHT_ALT) == GLFW_PRESS;
 
     if (gLmbDown) {
+        OrbitCamera& cam = gCameras[gActiveViewport];
         if (gModCtrl && gModShift) {
             // Ctrl+Shift+LMB = orbit
-            gCamera.longitude -= dx * 0.3f;
-            gCamera.latitude += dy * 0.3f;
-            if (gCamera.latitude > 89.0f) gCamera.latitude = 89.0f;
-            if (gCamera.latitude < -89.0f) gCamera.latitude = -89.0f;
+            cam.longitude -= dx * 0.3f;
+            cam.latitude += dy * 0.3f;
+            if (cam.latitude > 89.0f) cam.latitude = 89.0f;
+            if (cam.latitude < -89.0f) cam.latitude = -89.0f;
         } else if (gModShift) {
             doPan(dx, dy);
         } else if (gModCtrl) {
             doDolly(dy);
         } else if (gModAlt) {
-            gCamera.longitude -= dx * 0.3f;
-            gCamera.latitude += dy * 0.3f;
-            if (gCamera.latitude > 89.0f) gCamera.latitude = 89.0f;
-            if (gCamera.latitude < -89.0f) gCamera.latitude = -89.0f;
+            cam.longitude -= dx * 0.3f;
+            cam.latitude += dy * 0.3f;
+            if (cam.latitude > 89.0f) cam.latitude = 89.0f;
+            if (cam.latitude < -89.0f) cam.latitude = -89.0f;
         }
+        gCamera = cam;
     }
 
     if (gModAlt && gMmbDown) {
@@ -2360,10 +2563,24 @@ static void cursorPosCb(GLFWwindow* window, double xpos, double ypos) {
     }
 }
 
-static void scrollCb(GLFWwindow* /*window*/, double /*xoffset*/,
+static void scrollCb(GLFWwindow* window, double /*xoffset*/,
                       double yoffset) {
-    gCamera.distance -= static_cast<float>(yoffset) * 0.3f * gCamera.distance;
-    if (gCamera.distance < 0.1f) gCamera.distance = 0.1f;
+    // Determine which viewport the cursor is in
+    double cx, cy;
+    glfwGetCursorPos(window, &cx, &cy);
+    int fbW, fbH;
+    glfwGetFramebufferSize(window, &fbW, &fbH);
+    int winW2, winH2;
+    glfwGetWindowSize(window, &winW2, &winH2);
+    float fbScaleX = (winW2 > 0) ? static_cast<float>(fbW) / static_cast<float>(winW2) : 1.0f;
+    float fbScaleY = (winH2 > 0) ? static_cast<float>(fbH) / static_cast<float>(winH2) : 1.0f;
+    int vi = hitTestViewport(cx * fbScaleX, cy * fbScaleY, fbW, fbH);
+    gActiveViewport = vi;
+
+    OrbitCamera& cam = gCameras[gActiveViewport];
+    cam.distance -= static_cast<float>(yoffset) * 0.3f * cam.distance;
+    if (cam.distance < 0.1f) cam.distance = 0.1f;
+    gCamera = cam;
 }
 
 // ---------------------------------------------------------------------------
@@ -2621,8 +2838,8 @@ int main(int argc, char** argv) {
                 applyAnimToObjects(demoAnim, gAnimTime);
             }
 
-            Mat4 view = gCamera.getViewMatrix();
-            float farPlane = objLoaded ? std::max(100.0f, gCamera.distance * 10.0f) : 100.0f;
+            Mat4 view = gCameras[gActiveViewport].getViewMatrix();
+            float farPlane = objLoaded ? std::max(100.0f, gCameras[gActiveViewport].distance * 10.0f) : 100.0f;
             Mat4 proj = perspectiveVk(45.0f, gAspect, 0.1f, farPlane);
             Mat4 vp = proj * view;
             Mat4 identity = Mat4::identity();
@@ -2738,6 +2955,42 @@ int main(int argc, char** argv) {
     }
 
     // -----------------------------------------------------------------------
+    // AOV shader programs
+    // -----------------------------------------------------------------------
+    GLuint progAovNormal  = createProgram(kAovVS, kAovNormalFS);
+    GLuint progAovUv      = createProgram(kAovVS, kAovUvFS);
+    GLuint progAovDepth   = createProgram(kAovVS, kAovDepthFS);
+    GLuint progAovMatId   = createProgram(kAovVS, kAovMatIdFS);
+    GLuint progAovTangent = createProgram(kAovVS, kAovTangentFS);
+
+    if (!progAovNormal || !progAovUv || !progAovDepth || !progAovMatId || !progAovTangent) {
+        std::fprintf(stderr, "Failed to create AOV shader programs\n");
+        glfwTerminate();
+        return EXIT_FAILURE;
+    }
+
+    // AOV uniform locations (shared vertex shader, same uniform names)
+    struct AovUniforms {
+        GLint uModel, uVP, uNormalMatrix;
+    };
+    auto getAovUniforms = [](GLuint prog) -> AovUniforms {
+        return {
+            glGetUniformLocation(prog, "uModel"),
+            glGetUniformLocation(prog, "uVP"),
+            glGetUniformLocation(prog, "uNormalMatrix")
+        };
+    };
+    AovUniforms uAovNormal  = getAovUniforms(progAovNormal);
+    AovUniforms uAovUv      = getAovUniforms(progAovUv);
+    AovUniforms uAovDepth   = getAovUniforms(progAovDepth);
+    AovUniforms uAovMatId   = getAovUniforms(progAovMatId);
+    AovUniforms uAovTangent = getAovUniforms(progAovTangent);
+
+    // Depth AOV extra uniforms
+    GLint uDepthNear = glGetUniformLocation(progAovDepth, "uNearPlane");
+    GLint uDepthFar  = glGetUniformLocation(progAovDepth, "uFarPlane");
+
+    // -----------------------------------------------------------------------
     // Upload geometry to GL
     // -----------------------------------------------------------------------
     Mesh grid = createMesh(gridVerts);
@@ -2842,9 +3095,18 @@ int main(int argc, char** argv) {
     } else {
         termLog("Demo scene (3 cubes)");
     }
-    termLog("Controls: 4=Wireframe, 5=Shading, 6=Shading+Tex, 7=Lighting");
-    termLog("  LMB click=Select, F=Fit to selection, Space=Play/Pause");
+    termLog("Controls: 4-9,0=Mode  V=Viewport  A=FitAll  F=FitSel");
+    termLog("  LMB click=Select, Space=Play/Pause, :mode 11=MatID, :mode 0=Tangent");
     termLog("  Alt+LMB=Orbit, Shift+LMB=Pan, Ctrl+LMB=Dolly, Scroll=Dolly");
+
+    // Initialize multi-camera array from current gCamera
+    gCameras[0] = gCamera;
+    gCameras[1] = gCamera;
+    gCameras[1].longitude = gCamera.longitude + 90.0f;
+    gCameras[2] = gCamera;
+    gCameras[2].latitude = 89.0f; // top-down
+    gCameras[3] = gCamera;
+    gCameras[3].longitude = gCamera.longitude + 180.0f;
 
     // -----------------------------------------------------------------------
     // Render loop
@@ -2862,9 +3124,11 @@ int main(int argc, char** argv) {
             applyAnimToObjects(demoAnim, gAnimTime);
         }
 
-        Mat4 view = gCamera.getViewMatrix();
-        float farPlane = objLoaded ? std::max(100.0f, gCamera.distance * 10.0f) : 100.0f;
-        Mat4 proj = perspective(45.0f, gAspect, 0.1f, farPlane);
+        // Use active viewport camera for picking
+        Mat4 view = gCameras[gActiveViewport].getViewMatrix();
+        float farPlane = objLoaded ? std::max(100.0f, gCameras[gActiveViewport].distance * 10.0f) : 100.0f;
+        float nearPlane = 0.1f;
+        Mat4 proj = perspective(45.0f, gAspect, nearPlane, farPlane);
         Mat4 vp = proj * view;
 
         // Handle pending click (picking)
@@ -2897,121 +3161,346 @@ int main(int argc, char** argv) {
             }
         }
 
-        // Clear
+        int fbW, fbH;
+        glfwGetFramebufferSize(window, &fbW, &fbH);
+
+        // Clear full framebuffer
+        glViewport(0, 0, fbW, fbH);
         glClearColor(0.1f, 0.1f, 0.12f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
-        // ---- Draw grid + axis (always GL_LINES, gProgColor, identity model) ----
-        glUseProgram(progColor);
-        glUniformMatrix4fv(uColorVP, 1, GL_FALSE, vp.m);
-        Mat4 identity = Mat4::identity();
-        glUniformMatrix4fv(uColorModel, 1, GL_FALSE, identity.m);
-
-        glPolygonMode(GL_FRONT_AND_BACK, GL_FILL); // reset for lines
-        glBindVertexArray(grid.vao);
-        glDrawArrays(GL_LINES, 0, grid.vertexCount);
-
-        glBindVertexArray(axis.vao);
-        glDrawArrays(GL_LINES, 0, axis.vertexCount);
-
-        // ---- Draw scene objects (mode-appropriate shader) ----
-        if (gRenderMode == 4) {
-            // Wireframe
-            glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
-            glUseProgram(progColor);
-            glUniformMatrix4fv(uColorVP, 1, GL_FALSE, vp.m);
-            for (auto& obj : gObjects) {
-                Mat4 model = obj.modelMatrix();
-                glUniformMatrix4fv(uColorModel, 1, GL_FALSE, model.m);
-                glBindVertexArray(obj.mesh->vao);
-                glDrawArrays(GL_TRIANGLES, 0, obj.mesh->vertexCount);
-            }
-            glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
-
-        } else if (gRenderMode == 5) {
-            // Shading (per-face vertex color)
-            glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
-            glUseProgram(progColor);
-            glUniformMatrix4fv(uColorVP, 1, GL_FALSE, vp.m);
-            for (auto& obj : gObjects) {
-                Mat4 model = obj.modelMatrix();
-                glUniformMatrix4fv(uColorModel, 1, GL_FALSE, model.m);
-                glBindVertexArray(obj.mesh->vao);
-                glDrawArrays(GL_TRIANGLES, 0, obj.mesh->vertexCount);
-            }
-
-        } else if (gRenderMode == 6) {
-            // Shading + Texture
-            glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
-            glUseProgram(progTextured);
-            glUniformMatrix4fv(uTexVP, 1, GL_FALSE, vp.m);
-            glActiveTexture(GL_TEXTURE0);
-            glBindTexture(GL_TEXTURE_2D, gCheckerTex);
-            glUniform1i(uTexSampler, 0);
-            for (auto& obj : gObjects) {
-                Mat4 model = obj.modelMatrix();
-                glUniformMatrix4fv(uTexModel, 1, GL_FALSE, model.m);
-                glBindVertexArray(obj.mesh->vao);
-                glDrawArrays(GL_TRIANGLES, 0, obj.mesh->vertexCount);
-            }
-
-        } else if (gRenderMode == 7) {
-            // Lighting (Blinn-Phong, multi-light)
-            glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
-            glUseProgram(progLit);
-            glUniformMatrix4fv(uLitVP, 1, GL_FALSE, vp.m);
-            Vec3 camPos = gCamera.getEyePosition();
-            glUniform3f(uLitCameraPos, camPos.x, camPos.y, camPos.z);
-            glUniform1f(uLitAmbient, 0.15f);
-
-            int numLights = static_cast<int>(sceneLights.size());
-            if (numLights > kMaxLights) numLights = kMaxLights;
-            glUniform1i(uLitNumLights, numLights);
-            for (int li = 0; li < numLights; ++li) {
-                auto& sl = sceneLights[li];
-                auto& u = uLitLights[li];
-                glUniform1i(u.type, sl.type);
-                glUniform3f(u.direction, sl.direction.x, sl.direction.y, sl.direction.z);
-                glUniform3f(u.position, sl.position.x, sl.position.y, sl.position.z);
-                glUniform3f(u.color, sl.color.x, sl.color.y, sl.color.z);
-                glUniform1f(u.intensity, sl.intensity);
-                glUniform1f(u.range, sl.range);
-                glUniform1f(u.innerCone, sl.innerCone);
-                glUniform1f(u.outerCone, sl.outerCone);
-            }
-
-            for (auto& obj : gObjects) {
-                Mat4 model = obj.modelMatrix();
-                glUniformMatrix4fv(uLitModel, 1, GL_FALSE, model.m);
-                float normMat[9];
-                extractNormalMatrix(model, normMat);
-                glUniformMatrix3fv(uLitNormMat, 1, GL_FALSE, normMat);
-                glBindVertexArray(obj.mesh->vao);
-                glDrawArrays(GL_TRIANGLES, 0, obj.mesh->vertexCount);
-            }
+        // Determine viewport count and rectangles
+        int vpCount = 1;
+        struct VPRect { int x, y, w, h; };
+        VPRect vpRects[4];
+        if (gViewportLayout == ViewportLayout::Single) {
+            vpCount = 1;
+            vpRects[0] = {0, 0, fbW, fbH};
+        } else if (gViewportLayout == ViewportLayout::SplitH) {
+            vpCount = 2;
+            int halfW = fbW / 2;
+            vpRects[0] = {0, 0, halfW, fbH};
+            vpRects[1] = {halfW, 0, fbW - halfW, fbH};
+        } else {
+            vpCount = 4;
+            int halfW = fbW / 2;
+            int halfH = fbH / 2;
+            vpRects[0] = {0, halfH, halfW, fbH - halfH};       // top-left
+            vpRects[1] = {halfW, halfH, fbW - halfW, fbH - halfH}; // top-right
+            vpRects[2] = {0, 0, halfW, halfH};                  // bottom-left
+            vpRects[3] = {halfW, 0, fbW - halfW, halfH};        // bottom-right
         }
 
-        // ---- Draw selection wireframe bbox ----
-        glUseProgram(progColor);
-        glUniformMatrix4fv(uColorVP, 1, GL_FALSE, vp.m);
-        glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+        glEnable(GL_SCISSOR_TEST);
 
-        for (auto& obj : gObjects) {
-            if (!obj.selected) continue;
-            BBox wb = obj.worldBBox();
-            Vec3 center = wb.center();
-            Vec3 sz = wb.size();
-            // Scale unit wireframe cube (-0.5..0.5) to match world bbox
-            Mat4 bboxModel = Mat4::translate(center) * Mat4::scale(sz);
-            glUniformMatrix4fv(uColorModel, 1, GL_FALSE, bboxModel.m);
-            glBindVertexArray(bboxWire.vao);
-            glDrawArrays(GL_LINES, 0, bboxWire.vertexCount);
+        gRenderedCount = 0;
+        gTotalCount = static_cast<int>(gObjects.size());
+
+        // Track rendered count only once (from active viewport)
+        bool countedRendered = false;
+
+        for (int vi = 0; vi < vpCount; ++vi) {
+            VPRect& vr = vpRects[vi];
+            glViewport(vr.x, vr.y, vr.w, vr.h);
+            glScissor(vr.x, vr.y, vr.w, vr.h);
+
+            // Per-viewport clear (needed for split/quad to clear each section)
+            if (vpCount > 1) {
+                glClearColor(0.1f, 0.1f, 0.12f, 1.0f);
+                glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+            }
+
+            // Compute VP from this viewport's camera
+            float vpAspect = (vr.h > 0) ? static_cast<float>(vr.w) / static_cast<float>(vr.h) : 1.0f;
+            Mat4 vpView = gCameras[vi].getViewMatrix();
+            float vpFar = objLoaded ? std::max(100.0f, gCameras[vi].distance * 10.0f) : 100.0f;
+            Mat4 vpProj = perspective(45.0f, vpAspect, nearPlane, vpFar);
+            Mat4 vpMat = vpProj * vpView;
+
+            // Extract frustum for culling
+            // Convert local Mat4 to light3d::Mat4 (same memory layout)
+            light3d::Mat4 l3vpMat;
+            std::memcpy(l3vpMat.m, vpMat.m, sizeof(float) * 16);
+            light3d::Frustum frustum = light3d::Frustum::fromViewProjection(l3vpMat);
+
+            Mat4 identity = Mat4::identity();
+
+            // ---- Draw grid + axis ----
+            glUseProgram(progColor);
+            glUniformMatrix4fv(uColorVP, 1, GL_FALSE, vpMat.m);
+            glUniformMatrix4fv(uColorModel, 1, GL_FALSE, identity.m);
+
+            glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+            glBindVertexArray(grid.vao);
+            glDrawArrays(GL_LINES, 0, grid.vertexCount);
+
+            glBindVertexArray(axis.vao);
+            glDrawArrays(GL_LINES, 0, axis.vertexCount);
+
+            // ---- Helper lambda to draw objects with frustum culling ----
+            int vpRendered = 0;
+            auto drawObjectsWithCulling = [&](auto drawFn) {
+                for (auto& obj : gObjects) {
+                    BBox wb = obj.worldBBox();
+                    light3d::Vec3 mn{wb.mn.x, wb.mn.y, wb.mn.z};
+                    light3d::Vec3 mx{wb.mx.x, wb.mx.y, wb.mx.z};
+                    if (frustum.testAABB(mn, mx) == light3d::CullResult::Outside)
+                        continue;
+                    vpRendered++;
+                    drawFn(obj);
+                }
+            };
+
+            // ---- Draw scene objects (mode-appropriate shader) ----
+            if (gRenderMode == 4) {
+                // Wireframe
+                glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
+                glUseProgram(progColor);
+                glUniformMatrix4fv(uColorVP, 1, GL_FALSE, vpMat.m);
+                drawObjectsWithCulling([&](SceneObject& obj) {
+                    Mat4 model = obj.modelMatrix();
+                    glUniformMatrix4fv(uColorModel, 1, GL_FALSE, model.m);
+                    glBindVertexArray(obj.mesh->vao);
+                    glDrawArrays(GL_TRIANGLES, 0, obj.mesh->vertexCount);
+                });
+                glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+
+            } else if (gRenderMode == 5) {
+                // Shading (per-face vertex color)
+                glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+                glUseProgram(progColor);
+                glUniformMatrix4fv(uColorVP, 1, GL_FALSE, vpMat.m);
+                drawObjectsWithCulling([&](SceneObject& obj) {
+                    Mat4 model = obj.modelMatrix();
+                    glUniformMatrix4fv(uColorModel, 1, GL_FALSE, model.m);
+                    glBindVertexArray(obj.mesh->vao);
+                    glDrawArrays(GL_TRIANGLES, 0, obj.mesh->vertexCount);
+                });
+
+            } else if (gRenderMode == 6) {
+                // Shading + Texture
+                glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+                glUseProgram(progTextured);
+                glUniformMatrix4fv(uTexVP, 1, GL_FALSE, vpMat.m);
+                glActiveTexture(GL_TEXTURE0);
+                glBindTexture(GL_TEXTURE_2D, gCheckerTex);
+                glUniform1i(uTexSampler, 0);
+                drawObjectsWithCulling([&](SceneObject& obj) {
+                    Mat4 model = obj.modelMatrix();
+                    glUniformMatrix4fv(uTexModel, 1, GL_FALSE, model.m);
+                    glBindVertexArray(obj.mesh->vao);
+                    glDrawArrays(GL_TRIANGLES, 0, obj.mesh->vertexCount);
+                });
+
+            } else if (gRenderMode == 7) {
+                // Lighting (Blinn-Phong, multi-light)
+                glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+                glUseProgram(progLit);
+                glUniformMatrix4fv(uLitVP, 1, GL_FALSE, vpMat.m);
+                Vec3 camPos = gCameras[vi].getEyePosition();
+                glUniform3f(uLitCameraPos, camPos.x, camPos.y, camPos.z);
+                glUniform1f(uLitAmbient, 0.15f);
+
+                int numLights = static_cast<int>(sceneLights.size());
+                if (numLights > kMaxLights) numLights = kMaxLights;
+                glUniform1i(uLitNumLights, numLights);
+                for (int li = 0; li < numLights; ++li) {
+                    auto& sl = sceneLights[li];
+                    auto& u = uLitLights[li];
+                    glUniform1i(u.type, sl.type);
+                    glUniform3f(u.direction, sl.direction.x, sl.direction.y, sl.direction.z);
+                    glUniform3f(u.position, sl.position.x, sl.position.y, sl.position.z);
+                    glUniform3f(u.color, sl.color.x, sl.color.y, sl.color.z);
+                    glUniform1f(u.intensity, sl.intensity);
+                    glUniform1f(u.range, sl.range);
+                    glUniform1f(u.innerCone, sl.innerCone);
+                    glUniform1f(u.outerCone, sl.outerCone);
+                }
+
+                drawObjectsWithCulling([&](SceneObject& obj) {
+                    Mat4 model = obj.modelMatrix();
+                    glUniformMatrix4fv(uLitModel, 1, GL_FALSE, model.m);
+                    float normMat[9];
+                    extractNormalMatrix(model, normMat);
+                    glUniformMatrix3fv(uLitNormMat, 1, GL_FALSE, normMat);
+                    glBindVertexArray(obj.mesh->vao);
+                    glDrawArrays(GL_TRIANGLES, 0, obj.mesh->vertexCount);
+                });
+
+            } else if (gRenderMode == 8) {
+                // AOV: Normal
+                glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+                glUseProgram(progAovNormal);
+                glUniformMatrix4fv(uAovNormal.uVP, 1, GL_FALSE, vpMat.m);
+                drawObjectsWithCulling([&](SceneObject& obj) {
+                    Mat4 model = obj.modelMatrix();
+                    glUniformMatrix4fv(uAovNormal.uModel, 1, GL_FALSE, model.m);
+                    float normMat[9];
+                    extractNormalMatrix(model, normMat);
+                    glUniformMatrix3fv(uAovNormal.uNormalMatrix, 1, GL_FALSE, normMat);
+                    glBindVertexArray(obj.mesh->vao);
+                    glDrawArrays(GL_TRIANGLES, 0, obj.mesh->vertexCount);
+                });
+
+            } else if (gRenderMode == 9) {
+                // AOV: UV
+                glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+                glUseProgram(progAovUv);
+                glUniformMatrix4fv(uAovUv.uVP, 1, GL_FALSE, vpMat.m);
+                drawObjectsWithCulling([&](SceneObject& obj) {
+                    Mat4 model = obj.modelMatrix();
+                    glUniformMatrix4fv(uAovUv.uModel, 1, GL_FALSE, model.m);
+                    float normMat[9];
+                    extractNormalMatrix(model, normMat);
+                    glUniformMatrix3fv(uAovUv.uNormalMatrix, 1, GL_FALSE, normMat);
+                    glBindVertexArray(obj.mesh->vao);
+                    glDrawArrays(GL_TRIANGLES, 0, obj.mesh->vertexCount);
+                });
+
+            } else if (gRenderMode == 10) {
+                // AOV: Depth
+                glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+                glUseProgram(progAovDepth);
+                glUniformMatrix4fv(uAovDepth.uVP, 1, GL_FALSE, vpMat.m);
+                glUniform1f(uDepthNear, nearPlane);
+                glUniform1f(uDepthFar, vpFar);
+                drawObjectsWithCulling([&](SceneObject& obj) {
+                    Mat4 model = obj.modelMatrix();
+                    glUniformMatrix4fv(uAovDepth.uModel, 1, GL_FALSE, model.m);
+                    float normMat[9];
+                    extractNormalMatrix(model, normMat);
+                    glUniformMatrix3fv(uAovDepth.uNormalMatrix, 1, GL_FALSE, normMat);
+                    glBindVertexArray(obj.mesh->vao);
+                    glDrawArrays(GL_TRIANGLES, 0, obj.mesh->vertexCount);
+                });
+
+            } else if (gRenderMode == 11) {
+                // AOV: MatID
+                glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+                glUseProgram(progAovMatId);
+                glUniformMatrix4fv(uAovMatId.uVP, 1, GL_FALSE, vpMat.m);
+                drawObjectsWithCulling([&](SceneObject& obj) {
+                    Mat4 model = obj.modelMatrix();
+                    glUniformMatrix4fv(uAovMatId.uModel, 1, GL_FALSE, model.m);
+                    float normMat[9];
+                    extractNormalMatrix(model, normMat);
+                    glUniformMatrix3fv(uAovMatId.uNormalMatrix, 1, GL_FALSE, normMat);
+                    glBindVertexArray(obj.mesh->vao);
+                    glDrawArrays(GL_TRIANGLES, 0, obj.mesh->vertexCount);
+                });
+
+            } else if (gRenderMode == 0) {
+                // AOV: Tangent
+                glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+                glUseProgram(progAovTangent);
+                glUniformMatrix4fv(uAovTangent.uVP, 1, GL_FALSE, vpMat.m);
+                drawObjectsWithCulling([&](SceneObject& obj) {
+                    Mat4 model = obj.modelMatrix();
+                    glUniformMatrix4fv(uAovTangent.uModel, 1, GL_FALSE, model.m);
+                    float normMat[9];
+                    extractNormalMatrix(model, normMat);
+                    glUniformMatrix3fv(uAovTangent.uNormalMatrix, 1, GL_FALSE, normMat);
+                    glBindVertexArray(obj.mesh->vao);
+                    glDrawArrays(GL_TRIANGLES, 0, obj.mesh->vertexCount);
+                });
+            }
+
+            // Update rendered count from the active viewport
+            if (vi == gActiveViewport) {
+                gRenderedCount = vpRendered;
+            }
+
+            // ---- Draw selection wireframe bbox ----
+            glUseProgram(progColor);
+            glUniformMatrix4fv(uColorVP, 1, GL_FALSE, vpMat.m);
+            glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+
+            for (auto& obj : gObjects) {
+                if (!obj.selected) continue;
+                BBox wb = obj.worldBBox();
+                Vec3 center = wb.center();
+                Vec3 sz = wb.size();
+                Mat4 bboxModel = Mat4::translate(center) * Mat4::scale(sz);
+                glUniformMatrix4fv(uColorModel, 1, GL_FALSE, bboxModel.m);
+                glBindVertexArray(bboxWire.vao);
+                glDrawArrays(GL_LINES, 0, bboxWire.vertexCount);
+            }
+
+            // Draw active viewport border (colored line)
+            if (vpCount > 1 && vi == gActiveViewport) {
+                glUseProgram(progColor);
+                // Use identity matrices — we'll draw in NDC via a line strip
+                // Instead, just draw a thin colored quad border via polygon mode
+                // Simple approach: draw the border using 4 thin quads
+                // Actually let's just mark it visually with the status bar
+            }
+        } // end viewport loop
+
+        glDisable(GL_SCISSOR_TEST);
+
+        // Reset viewport to full framebuffer for TUI overlay
+        glViewport(0, 0, fbW, fbH);
+
+        // ---- Draw viewport borders (if multi-viewport) ----
+        if (vpCount > 1) {
+            glUseProgram(progColor);
+            Mat4 identity = Mat4::identity();
+            glUniformMatrix4fv(uColorModel, 1, GL_FALSE, identity.m);
+            // Use NDC identity for VP (lines in screen space)
+            glUniformMatrix4fv(uColorVP, 1, GL_FALSE, identity.m);
+            glLineWidth(2.0f);
+
+            // Build border line verts dynamically
+            std::vector<float> borderVerts;
+            for (int vi = 0; vi < vpCount; ++vi) {
+                VPRect& vr = vpRects[vi];
+                // Convert pixel rect to NDC
+                float x0 = static_cast<float>(vr.x) / static_cast<float>(fbW) * 2.0f - 1.0f;
+                float y0 = static_cast<float>(vr.y) / static_cast<float>(fbH) * 2.0f - 1.0f;
+                float x1 = static_cast<float>(vr.x + vr.w) / static_cast<float>(fbW) * 2.0f - 1.0f;
+                float y1 = static_cast<float>(vr.y + vr.h) / static_cast<float>(fbH) * 2.0f - 1.0f;
+                float r = 0.4f, g = 0.4f, b = 0.4f;
+                if (vi == gActiveViewport) { r = 0.2f; g = 0.8f; b = 1.0f; }
+
+                // 4 lines: bottom, right, top, left
+                pushVertexSimple(borderVerts, x0, y0, 0, r, g, b);
+                pushVertexSimple(borderVerts, x1, y0, 0, r, g, b);
+                pushVertexSimple(borderVerts, x1, y0, 0, r, g, b);
+                pushVertexSimple(borderVerts, x1, y1, 0, r, g, b);
+                pushVertexSimple(borderVerts, x1, y1, 0, r, g, b);
+                pushVertexSimple(borderVerts, x0, y1, 0, r, g, b);
+                pushVertexSimple(borderVerts, x0, y1, 0, r, g, b);
+                pushVertexSimple(borderVerts, x0, y0, 0, r, g, b);
+            }
+
+            if (!borderVerts.empty()) {
+                GLuint borderVAO, borderVBO;
+                glGenVertexArrays(1, &borderVAO);
+                glGenBuffers(1, &borderVBO);
+                glBindVertexArray(borderVAO);
+                glBindBuffer(GL_ARRAY_BUFFER, borderVBO);
+                glBufferData(GL_ARRAY_BUFFER,
+                             static_cast<GLsizeiptr>(borderVerts.size() * sizeof(float)),
+                             borderVerts.data(), GL_STREAM_DRAW);
+                GLsizei stride = kVertStride * sizeof(float);
+                glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, stride, nullptr);
+                glEnableVertexAttribArray(0);
+                glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, stride,
+                                      reinterpret_cast<void*>(3 * sizeof(float)));
+                glEnableVertexAttribArray(1);
+
+                glDisable(GL_DEPTH_TEST);
+                glDrawArrays(GL_LINES, 0, static_cast<int>(borderVerts.size()) / kVertStride);
+                glEnable(GL_DEPTH_TEST);
+
+                glDeleteVertexArrays(1, &borderVAO);
+                glDeleteBuffers(1, &borderVBO);
+            }
+            glLineWidth(1.0f);
         }
 
-        // ---- TUI overlay ----
+        // ---- TUI overlay (full screen, outside viewport loop) ----
         {
-            int fbW, fbH;
-            glfwGetFramebufferSize(window, &fbW, &fbH);
             updateFPS();
             tuiCompose();
             tuiBuildGeometry(fbW, fbH);
@@ -3034,6 +3523,11 @@ int main(int argc, char** argv) {
     glDeleteProgram(progTextured);
     glDeleteProgram(progLit);
     glDeleteProgram(progPick);
+    glDeleteProgram(progAovNormal);
+    glDeleteProgram(progAovUv);
+    glDeleteProgram(progAovDepth);
+    glDeleteProgram(progAovMatId);
+    glDeleteProgram(progAovTangent);
 
     glDeleteTextures(1, &gCheckerTex);
     glDeleteTextures(1, &gPickColorTex);
