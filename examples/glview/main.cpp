@@ -7,6 +7,11 @@
 #include "vk_backend.h"
 #endif
 
+#ifdef LIGHT3D_EXAMPLE_USE_LIGHTUSD_C
+#include <lightusd/lightusd-c.h>
+#include <lydra_c_mesh.h>
+#endif
+
 #include <light3d/light3d.h>
 #include <light3d/camera.h>
 #include <light3d/node_animation.h>
@@ -287,7 +292,6 @@ struct OrbitCamera {
         up = cross(right, f);
     }
 };
-
 // ---------------------------------------------------------------------------
 // Mesh (OpenGL)
 // ---------------------------------------------------------------------------
@@ -376,6 +380,171 @@ static GLuint gCheckerTex = 0;
 
 #ifdef GLVIEW_VULKAN_ENABLED
 static VulkanBackend* gVkBackend = nullptr;
+#endif
+
+#ifdef LIGHT3D_EXAMPLE_USE_LIGHTUSD_C
+static void loadUsdFile(const char* path) {
+    printf("Loading USD file: %s\n", path);
+    
+    LusdInstanceCreateInfo instCI = {};
+    instCI.sType = LUSD_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+    instCI.apiVersion = LUSD_API_VERSION;
+    
+    LusdInstance instance;
+    LusdResult res = lusdCreateInstance(&instCI, NULL, &instance);
+    if (res != LUSD_SUCCESS) {
+        printf("Failed to create lightusd instance: %s\n", lusdResultToString(res));
+        return;
+    }
+
+    LusdStageLoadInfo loadInfo = {};
+    loadInfo.sType = LUSD_STRUCTURE_TYPE_STAGE_LOAD_INFO;
+    loadInfo.pFilePath = path;
+    
+    LusdStage stage;
+    res = lusdLoadStage(instance, &loadInfo, &stage);
+    if (res != LUSD_SUCCESS) {
+        printf("Failed to load USD stage: %s\n", lusdResultToString(res));
+        lusdDestroyInstance(instance, NULL);
+        return;
+    }
+
+    uint32_t rootCount = 0;
+    lusdStageGetRootPrimCount(stage, &rootCount);
+    std::vector<LusdPrim> rootPrims(rootCount);
+    lusdStageGetRootPrims(stage, rootCount, rootPrims.data());
+
+    std::vector<LusdPrim> queue = rootPrims;
+    
+    while(!queue.empty()) {
+        LusdPrim prim = queue.back();
+        queue.pop_back();
+        
+        const char* typeName = lusdPrimGetTypeName(prim);
+        
+        if (strcmp(typeName, "Mesh") == 0) {
+            LusdValue val;
+            
+            // points
+            if (lusdPrimGetAttributeDefault(prim, "points", &val) != LUSD_SUCCESS) goto next_child;
+            uint64_t ptCount = 0;
+            const LusdFloat3* pts = nullptr;
+            if (lusdValueGetArrayPtrFloat3(val, &ptCount, &pts) != LUSD_SUCCESS) goto next_child;
+            
+            // faceVertexCounts
+            if (lusdPrimGetAttributeDefault(prim, "faceVertexCounts", &val) != LUSD_SUCCESS) goto next_child;
+            uint64_t fvcCount = 0;
+            const int32_t* fvcs = nullptr;
+            if (lusdValueGetArrayPtrInt32(val, &fvcCount, &fvcs) != LUSD_SUCCESS) goto next_child;
+            
+            // faceVertexIndices
+            if (lusdPrimGetAttributeDefault(prim, "faceVertexIndices", &val) != LUSD_SUCCESS) goto next_child;
+            uint64_t fviCount = 0;
+            const int32_t* fvis = nullptr;
+            if (lusdValueGetArrayPtrInt32(val, &fviCount, &fvis) != LUSD_SUCCESS) goto next_child;
+            
+            // normals (optional)
+            const LusdFloat3* normals = nullptr;
+            uint64_t normalCount = 0;
+            if (lusdPrimGetAttributeDefault(prim, "normals", &val) == LUSD_SUCCESS) {
+                lusdValueGetArrayPtrFloat3(val, &normalCount, &normals);
+            }
+            
+            // uvs (optional)
+            const LusdFloat2* uvs = nullptr;
+            uint64_t uvCount = 0;
+            if (lusdPrimGetAttributeDefault(prim, "primvars:st", &val) == LUSD_SUCCESS) {
+                lusdValueGetArrayPtrFloat2(val, &uvCount, &uvs);
+            }
+            
+            // Triangulate
+            uint32_t* triIndices = NULL;
+            uint32_t triCount = 0;
+            if (lydra_c_triangulate(fvis, (uint32_t)fviCount, fvcs, (uint32_t)fvcCount, &triIndices, &triCount) == 0) {
+                
+                std::vector<float> verts;
+                verts.reserve(triCount * 3 * 11);
+                
+                SceneObject obj;
+                obj.name = lusdPrimGetName(prim);
+                obj.position = {0,0,0}; 
+                
+                // Build vertex buffer (soup)
+                int fvOffset = 0;
+                for(uint32_t f=0; f<fvcCount; ++f) {
+                    int fvc = fvcs[f];
+                    for(int v=1; v<fvc-1; ++v) {
+                        int i0 = fvOffset + 0;
+                        int i1 = fvOffset + v;
+                        int i2 = fvOffset + v + 1;
+                        
+                        int vIdx[3] = { fvis[i0], fvis[i1], fvis[i2] };
+                        int fvIdx[3] = { i0, i1, i2 };
+                        
+                        for(int k=0; k<3; ++k) {
+                            int vi = vIdx[k];
+                            int fvi = fvIdx[k];
+                            
+                            float px = pts[vi].x;
+                            float py = pts[vi].y;
+                            float pz = pts[vi].z;
+                            
+                            float nx=0, ny=1, nz=0;
+                            if (normals) {
+                                int nIdx = (normalCount == ptCount) ? vi : fvi;
+                                if (nIdx < (int)normalCount) {
+                                    nx = normals[nIdx].x; ny = normals[nIdx].y; nz = normals[nIdx].z;
+                                }
+                            }
+                            
+                            float u=0, v=0;
+                            if (uvs) {
+                                int uIdx = (uvCount == ptCount) ? vi : fvi;
+                                if (uIdx < (int)uvCount) {
+                                    u = uvs[uIdx].x; v = uvs[uIdx].y;
+                                }
+                            }
+                            
+                            pushVertex(verts, px, py, pz, 0.8f, 0.8f, 0.8f, nx, ny, nz, u, v);
+                            obj.localBBox.expand({px, py, pz});
+                        }
+                    }
+                    fvOffset += fvc;
+                }
+                
+                #ifdef GLVIEW_OPENGL_ENABLED
+                if (!gUseVulkan) {
+                    Mesh* m = new Mesh(createMesh(verts));
+                    obj.mesh = m;
+                }
+                #endif
+                
+                #ifdef GLVIEW_VULKAN_ENABLED
+                if (gUseVulkan && gVkBackend) {
+                    obj.meshIndex = 0; // Not fully wired for multiple meshes in Vulkan path here
+                    // In a real app we'd store the VkMesh
+                }
+                #endif
+                
+                obj.pickId = (int)gObjects.size() + 1;
+                gObjects.push_back(obj);
+                free(triIndices);
+            }
+        }
+        
+        next_child:;
+        uint32_t childCount = 0;
+        lusdPrimGetChildCount(prim, &childCount);
+        if (childCount > 0) {
+            std::vector<LusdPrim> children(childCount);
+            lusdPrimGetChildren(prim, childCount, children.data());
+            for(auto c : children) queue.push_back(c);
+        }
+    }
+    
+    lusdDestroyStage(instance, stage);
+    lusdDestroyInstance(instance, NULL);
+}
 #endif
 
 #ifdef GLVIEW_OPENGL_ENABLED
@@ -2701,26 +2870,45 @@ int main(int argc, char** argv) {
     cubeBBox.mx = { 0.5f,  0.5f,  0.5f};
 
     // -----------------------------------------------------------------------
-    // OBJ loading (if requested)
+    // Model loading (if requested)
     // -----------------------------------------------------------------------
     std::vector<float> objVerts;
     BBox objBBox;
     bool objLoaded = false;
+    bool usdLoaded = false;
 
     if (!gObjFilePath.empty()) {
-        std::printf("Loading OBJ: %s\n", gObjFilePath.c_str());
-        light3d::ObjLoadResult objResult = light3d::loadObj(gObjFilePath);
-        if (objResult.success) {
-            ObjConvertResult conv = buildVertsFromObjResult(objResult);
-            objVerts = std::move(conv.verts);
-            objBBox = conv.bbox;
-            objLoaded = true;
-            std::printf("OBJ loaded: %zu triangles\n",
-                        objVerts.size() / (kVertStride * 3));
+        auto endsWith = [](const std::string& s, const std::string& ext) {
+            if (s.length() < ext.length()) return false;
+            return s.compare(s.length() - ext.length(), ext.length(), ext) == 0;
+        };
+
+        if (endsWith(gObjFilePath, ".usd") || endsWith(gObjFilePath, ".usdc") ||
+            endsWith(gObjFilePath, ".usda") || endsWith(gObjFilePath, ".usdz")) {
+#ifdef LIGHT3D_EXAMPLE_USE_LIGHTUSD_C
+            loadUsdFile(gObjFilePath.c_str());
+            if (!gObjects.empty()) {
+                usdLoaded = true;
+                fitCameraToAll();
+            }
+#else
+            std::fprintf(stderr, "USD support disabled. Build with -DLIGHT3D_EXAMPLE_USE_LIGHTUSD_C=ON\n");
+#endif
         } else {
-            std::fprintf(stderr, "Failed to load OBJ '%s': %s\n",
-                         gObjFilePath.c_str(), objResult.errorMessage.c_str());
-            std::fprintf(stderr, "Falling back to demo scene\n");
+            std::printf("Loading OBJ: %s\n", gObjFilePath.c_str());
+            light3d::ObjLoadResult objResult = light3d::loadObj(gObjFilePath);
+            if (objResult.success) {
+                ObjConvertResult conv = buildVertsFromObjResult(objResult);
+                objVerts = std::move(conv.verts);
+                objBBox = conv.bbox;
+                objLoaded = true;
+                std::printf("OBJ loaded: %zu triangles\n",
+                            objVerts.size() / (kVertStride * 3));
+            } else {
+                std::fprintf(stderr, "Failed to load OBJ '%s': %s\n",
+                             gObjFilePath.c_str(), objResult.errorMessage.c_str());
+                std::fprintf(stderr, "Falling back to demo scene\n");
+            }
         }
     }
 
@@ -2729,7 +2917,7 @@ int main(int argc, char** argv) {
     // -----------------------------------------------------------------------
     light3d::NodeAnimationClip demoAnim("demo");
     float animDuration = 0.0f;
-    if (!objLoaded) {
+    if (!objLoaded && !usdLoaded) {
         // CubeCenter: bounces up and down
         demoAnim.addTranslationKey("CubeCenter", 0.0f, light3d::Vec3(0, 0.5f, 0));
         demoAnim.addTranslationKey("CubeCenter", 1.0f, light3d::Vec3(0, 2.0f, 0));
