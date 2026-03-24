@@ -60,8 +60,10 @@ public:
     Vec3 up{0.0f, 1.0f, 0.0f};
 
     Mat4 getViewMatrix() const;
-    Mat4 getProjectionMatrix() const;
+    Mat4 getProjectionMatrix() const;          // OpenGL: Z → [-1, 1]
+    Mat4 getProjectionMatrixZeroOne() const;    // WebGPU/Vulkan: Z → [0, 1]
     Mat4 getViewProjectionMatrix() const;
+    Mat4 getViewProjectionMatrixZeroOne() const;
     Frustum getFrustum() const;
 };
 

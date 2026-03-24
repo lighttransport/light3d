@@ -82,8 +82,17 @@ Mat4 CameraView::getProjectionMatrix() const {
     return perspective(fovRad, aspectRatio, nearPlane, farPlane);
 }
 
+Mat4 CameraView::getProjectionMatrixZeroOne() const {
+    float fovRad = fovYDeg * (3.14159265f / 180.0f);
+    return perspectiveZeroOne(fovRad, aspectRatio, nearPlane, farPlane);
+}
+
 Mat4 CameraView::getViewProjectionMatrix() const {
     return getProjectionMatrix() * getViewMatrix();
+}
+
+Mat4 CameraView::getViewProjectionMatrixZeroOne() const {
+    return getProjectionMatrixZeroOne() * getViewMatrix();
 }
 
 Frustum CameraView::getFrustum() const {

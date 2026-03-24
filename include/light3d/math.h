@@ -140,9 +140,9 @@ struct Mat4 {
     const float* data() const { return m; }
     float* data() { return m; }
 
-    // Access element: column c, row r
-    float& at(int c, int r) { return m[c * 4 + r]; }
-    float at(int c, int r) const { return m[c * 4 + r]; }
+    // Access element by row and column: m[col*4 + row]
+    float& at(int row, int col) { return m[col * 4 + row]; }
+    float at(int row, int col) const { return m[col * 4 + row]; }
 };
 
 inline Mat4 operator*(const Mat4& a, const Mat4& b) {
@@ -175,5 +175,7 @@ inline Vec3 transformVector(const Mat4& m, const Vec3& v) {
 
 Mat4 lookAt(const Vec3& eye, const Vec3& target, const Vec3& up);
 Mat4 perspective(float fovYRadians, float aspect, float near, float far);
+// Vulkan/WebGPU perspective: Z maps to [0, 1], Y is NOT flipped
+Mat4 perspectiveZeroOne(float fovYRadians, float aspect, float near, float far);
 
 } // namespace light3d
