@@ -55,6 +55,29 @@ static Vec3 vec3Max(Vec3 a, Vec3 b) {
     return {std::fmax(a.x, b.x), std::fmax(a.y, b.y), std::fmax(a.z, b.z)};
 }
 
+static float clampf(float v, float lo, float hi) {
+    return std::fmax(lo, std::fmin(v, hi));
+}
+
+static Vec3 saturate(Vec3 v) {
+    return {clampf(v.x, 0.0f, 1.0f),
+            clampf(v.y, 0.0f, 1.0f),
+            clampf(v.z, 0.0f, 1.0f)};
+}
+
+static Vec3 shadeVertexColor(Vec3 baseColor, Vec3 normal) {
+    Vec3 n = normalize(normal);
+    Vec3 keyDir = normalize({0.45f, 0.8f, 0.35f});
+    Vec3 fillDir = normalize({-0.35f, 0.25f, -0.9f});
+    float key = std::fmax(0.0f, dot(n, keyDir));
+    float fill = std::fmax(0.0f, dot(n, fillDir));
+    float hemi = clampf(n.y * 0.5f + 0.5f, 0.0f, 1.0f);
+
+    Vec3 lit = baseColor * (0.22f + key * 0.78f + fill * 0.18f);
+    lit = lit + Vec3{0.04f, 0.05f, 0.07f} * hemi;
+    return saturate(lit);
+}
+
 // 4x4 column-major matrix
 struct Mat4 {
     float m[16] = {};
@@ -329,7 +352,8 @@ static OrbitCamera gCamera;
 static float gAspect = 800.0f / 600.0f;
 static double gLastCursorX = 0, gLastCursorY = 0;
 static bool gLmbDown = false, gMmbDown = false, gRmbDown = false;
-static bool gModCtrl = false, gModShift = false, gModAlt = false;
+static bool gModCtrl = false, gModShift = false, gModAlt = false, gModTab = false;
+static bool gSuppressClickPick = false;
 
 // Click detection
 static double gClickPressX = 0, gClickPressY = 0;
@@ -915,15 +939,16 @@ static std::vector<float> buildCubeVerts() {
         Vec3 e1 = v1 - v0;
         Vec3 e2 = v2 - v0;
         Vec3 n = normalize(cross(e1, e2));
+        Vec3 shaded = shadeVertexColor({f.r, f.g, f.b}, n);
 
         // Triangle 1: 0-1-2
-        pushVertex(verts, f.v[0][0], f.v[0][1], f.v[0][2], f.r, f.g, f.b, n.x, n.y, n.z, uvs[0][0], uvs[0][1]);
-        pushVertex(verts, f.v[1][0], f.v[1][1], f.v[1][2], f.r, f.g, f.b, n.x, n.y, n.z, uvs[1][0], uvs[1][1]);
-        pushVertex(verts, f.v[2][0], f.v[2][1], f.v[2][2], f.r, f.g, f.b, n.x, n.y, n.z, uvs[2][0], uvs[2][1]);
+        pushVertex(verts, f.v[0][0], f.v[0][1], f.v[0][2], shaded.x, shaded.y, shaded.z, n.x, n.y, n.z, uvs[0][0], uvs[0][1]);
+        pushVertex(verts, f.v[1][0], f.v[1][1], f.v[1][2], shaded.x, shaded.y, shaded.z, n.x, n.y, n.z, uvs[1][0], uvs[1][1]);
+        pushVertex(verts, f.v[2][0], f.v[2][1], f.v[2][2], shaded.x, shaded.y, shaded.z, n.x, n.y, n.z, uvs[2][0], uvs[2][1]);
         // Triangle 2: 0-2-3
-        pushVertex(verts, f.v[0][0], f.v[0][1], f.v[0][2], f.r, f.g, f.b, n.x, n.y, n.z, uvs[0][0], uvs[0][1]);
-        pushVertex(verts, f.v[2][0], f.v[2][1], f.v[2][2], f.r, f.g, f.b, n.x, n.y, n.z, uvs[2][0], uvs[2][1]);
-        pushVertex(verts, f.v[3][0], f.v[3][1], f.v[3][2], f.r, f.g, f.b, n.x, n.y, n.z, uvs[3][0], uvs[3][1]);
+        pushVertex(verts, f.v[0][0], f.v[0][1], f.v[0][2], shaded.x, shaded.y, shaded.z, n.x, n.y, n.z, uvs[0][0], uvs[0][1]);
+        pushVertex(verts, f.v[2][0], f.v[2][1], f.v[2][2], shaded.x, shaded.y, shaded.z, n.x, n.y, n.z, uvs[2][0], uvs[2][1]);
+        pushVertex(verts, f.v[3][0], f.v[3][1], f.v[3][2], shaded.x, shaded.y, shaded.z, n.x, n.y, n.z, uvs[3][0], uvs[3][1]);
     }
 
     return verts;
@@ -1010,11 +1035,24 @@ static ObjConvertResult buildVertsFromObjResult(const light3d::ObjLoadResult& ob
                     ? geo.uvs[idx[k]] : light3d::Vec3(0, 0, 0);
             }
 
+            Vec3 faceP0 = {p[0].x, p[0].y, p[0].z};
+            Vec3 faceP1 = {p[1].x, p[1].y, p[1].z};
+            Vec3 faceP2 = {p[2].x, p[2].y, p[2].z};
+            Vec3 faceNormal = normalize(cross(faceP1 - faceP0, faceP2 - faceP0));
+            if (vec3Length(faceNormal) < 1e-6f) {
+                faceNormal = {0.0f, 1.0f, 0.0f};
+            }
+
             for (int k = 0; k < 3; ++k) {
+                Vec3 normal = {n[k].x, n[k].y, n[k].z};
+                if (vec3Length(normal) < 1e-6f) {
+                    normal = faceNormal;
+                }
+                Vec3 shaded = shadeVertexColor({cr, cg, cb}, normal);
                 pushVertex(result.verts,
                            p[k].x, p[k].y, p[k].z,
-                           cr, cg, cb,
-                           n[k].x, n[k].y, n[k].z,
+                           shaded.x, shaded.y, shaded.z,
+                           normal.x, normal.y, normal.z,
                            uv[k].x, uv[k].y);
                 result.bbox.expand({p[k].x, p[k].y, p[k].z});
             }
@@ -1363,6 +1401,16 @@ struct TuiCell {
 
 static int gTuiCols = 0, gTuiRows = 0;
 static std::vector<TuiCell> gTuiCells;
+static int gTuiCellW = kFontGlyphW;
+static int gTuiCellH = kFontGlyphH;
+static float gMonitorScaleX = 1.0f;
+static float gMonitorScaleY = 1.0f;
+static float gWindowScaleX = 1.0f;
+static float gWindowScaleY = 1.0f;
+static float gFramebufferScaleX = 1.0f;
+static float gFramebufferScaleY = 1.0f;
+static int gDisplayPixelW = 0;
+static int gDisplayPixelH = 0;
 
 #ifdef GLVIEW_OPENGL_ENABLED
 // TUI GL resources
@@ -1451,8 +1499,8 @@ static uint8_t gTuiCurFg = 15;
 static uint8_t gTuiCurBg = 0;
 
 static void tuiResize(int fbW, int fbH) {
-    gTuiCols = fbW / kFontGlyphW;
-    gTuiRows = fbH / kFontGlyphH;
+    gTuiCols = fbW / gTuiCellW;
+    gTuiRows = fbH / gTuiCellH;
     if (gTuiCols < 1) gTuiCols = 1;
     if (gTuiRows < 1) gTuiRows = 1;
     gTuiCells.resize(gTuiCols * gTuiRows);
@@ -1853,10 +1901,10 @@ static void tuiBuildGeometry(int fbW, int fbH) {
             // Skip empty cells with black background (fully transparent)
             if (cell.ch == 0 && cell.bg == 0) continue;
 
-            float x0 = static_cast<float>(col * kFontGlyphW);
-            float y0 = static_cast<float>(row * kFontGlyphH);
-            float x1 = x0 + kFontGlyphW;
-            float y1 = y0 + kFontGlyphH;
+            float x0 = static_cast<float>(col * gTuiCellW);
+            float y0 = static_cast<float>(row * gTuiCellH);
+            float x1 = x0 + gTuiCellW;
+            float y1 = y0 + gTuiCellH;
 
             // UV from atlas
             int glyphCol = cell.ch % kAtlasCols;
@@ -2194,13 +2242,99 @@ static void fitCameraToSelection() {
 // ---------------------------------------------------------------------------
 // GLFW callbacks
 // ---------------------------------------------------------------------------
-static void framebufferSizeCb(GLFWwindow* /*window*/, int width, int height) {
+static void updateDisplayScaling(GLFWwindow* window, GLFWmonitor* monitor,
+                                 const char* reason) {
+    if (!window) return;
+
+    int winW = 0, winH = 0;
+    int fbW = 0, fbH = 0;
+    glfwGetWindowSize(window, &winW, &winH);
+    glfwGetFramebufferSize(window, &fbW, &fbH);
+
+    if (monitor) {
+        glfwGetMonitorContentScale(monitor, &gMonitorScaleX, &gMonitorScaleY);
+        if (const GLFWvidmode* mode = glfwGetVideoMode(monitor)) {
+            gDisplayPixelW = mode->width;
+            gDisplayPixelH = mode->height;
+        }
+    } else {
+        gMonitorScaleX = 1.0f;
+        gMonitorScaleY = 1.0f;
+    }
+
+    gWindowScaleX = gMonitorScaleX;
+    gWindowScaleY = gMonitorScaleY;
+#if GLFW_VERSION_MAJOR > 3 || (GLFW_VERSION_MAJOR == 3 && GLFW_VERSION_MINOR >= 3)
+    glfwGetWindowContentScale(window, &gWindowScaleX, &gWindowScaleY);
+#endif
+
+    gFramebufferScaleX =
+        (winW > 0) ? (static_cast<float>(fbW) / static_cast<float>(winW)) : 1.0f;
+    gFramebufferScaleY =
+        (winH > 0) ? (static_cast<float>(fbH) / static_cast<float>(winH)) : 1.0f;
+
+    int pixelW = std::max(gDisplayPixelW, fbW);
+    int pixelH = std::max(gDisplayPixelH, fbH);
+    bool is4KDisplay = (pixelW >= 3800) || (pixelH >= 2100);
+
+    int prevCellW = gTuiCellW;
+    int prevCellH = gTuiCellH;
+    gTuiCellW = is4KDisplay ? 16 : kFontGlyphW;
+    gTuiCellH = gTuiCellW * 2;
+
+    tuiResize(std::max(fbW, 1), std::max(fbH, 1));
+
+    if (prevCellW != gTuiCellW || prevCellH != gTuiCellH || reason) {
+        std::printf(
+            "Display scaling (%s): desktop=%dx%d monitor=%.2fx%.2f "
+            "window=%.2fx%.2f framebuffer=%.2fx%.2f fb=%dx%d tui=%dx%d\n",
+            reason ? reason : "update", gDisplayPixelW, gDisplayPixelH,
+            gMonitorScaleX, gMonitorScaleY, gWindowScaleX, gWindowScaleY,
+            gFramebufferScaleX, gFramebufferScaleY, fbW, fbH, gTuiCellW,
+            gTuiCellH);
+    }
+}
+
+#if GLFW_VERSION_MAJOR > 3 || (GLFW_VERSION_MAJOR == 3 && GLFW_VERSION_MINOR >= 3)
+static void windowContentScaleCb(GLFWwindow* window, float xscale, float yscale) {
+    gWindowScaleX = xscale;
+    gWindowScaleY = yscale;
+    updateDisplayScaling(window, glfwGetPrimaryMonitor(), "content scale");
+}
+#endif
+
+static float getNavigationDeltaScale(GLFWwindow* window) {
+    if (!window) return 1.0f;
+
+    int winW = 0, winH = 0;
+    glfwGetWindowSize(window, &winW, &winH);
+
+    constexpr float kReferenceLogicalWidth = 1280.0f;
+    constexpr float kReferenceLogicalHeight = 960.0f;
+
+    float scale = 1.0f;
+    bool hiDpiDisplay = (gDisplayPixelW >= 3800) || (gDisplayPixelH >= 2100) ||
+                        (gWindowScaleX > 1.01f) || (gWindowScaleY > 1.01f) ||
+                        (gMonitorScaleX > 1.01f) || (gMonitorScaleY > 1.01f);
+    if (hiDpiDisplay) {
+        float widthScale =
+            (winW > 0) ? (kReferenceLogicalWidth / static_cast<float>(winW)) : 1.0f;
+        float heightScale =
+            (winH > 0) ? (kReferenceLogicalHeight / static_cast<float>(winH)) : 1.0f;
+        scale = std::min(1.0f, std::min(widthScale, heightScale));
+        scale = clampf(scale, 0.6f, 1.0f);
+    }
+
+    return scale;
+}
+
+static void framebufferSizeCb(GLFWwindow* window, int width, int height) {
     if (height == 0) height = 1;
     gAspect = static_cast<float>(width) / static_cast<float>(height);
 #ifdef GLVIEW_OPENGL_ENABLED
     if (!gUseVulkan) {
         // Don't set glViewport here — the viewport loop handles it per-viewport
-        tuiResize(width, height);
+        updateDisplayScaling(window, glfwGetPrimaryMonitor(), "framebuffer resize");
     }
 #endif
 #ifdef GLVIEW_VULKAN_ENABLED
@@ -2300,6 +2434,8 @@ static void keyCb(GLFWwindow* window, int key, int /*scancode*/, int action,
         gModShift = down;
     if (key == GLFW_KEY_LEFT_ALT || key == GLFW_KEY_RIGHT_ALT)
         gModAlt = down;
+    if (key == GLFW_KEY_TAB)
+        gModTab = down;
 
     // --- Command input mode ---
     if (gCmdInputActive) {
@@ -2415,13 +2551,18 @@ static void keyCb(GLFWwindow* window, int key, int /*scancode*/, int action,
 }
 
 static int hitTestViewport(double cx, double cy, int fbW, int fbH);
+static void updateDisplayScaling(GLFWwindow* window, GLFWmonitor* monitor,
+                                 const char* reason);
+static float getNavigationDeltaScale(GLFWwindow* window);
+static void syncModifierState(GLFWwindow* window, int mods = -1);
+static bool wantsOrbitNavigation();
+static bool wantsPanNavigation();
+static bool wantsDollyNavigation();
+static bool hasNavigationGesture();
 
 static void mouseButtonCb(GLFWwindow* window, int button, int action,
                            int mods) {
-    // Update modifier state from the mods bitmask (hardware-level, always reliable)
-    gModCtrl  = (mods & GLFW_MOD_CONTROL) != 0;
-    gModShift = (mods & GLFW_MOD_SHIFT) != 0;
-    gModAlt   = (mods & GLFW_MOD_ALT) != 0;
+    syncModifierState(window, mods);
 
     double cx, cy;
     glfwGetCursorPos(window, &cx, &cy);
@@ -2447,6 +2588,7 @@ static void mouseButtonCb(GLFWwindow* window, int button, int action,
         }
         if (button == GLFW_MOUSE_BUTTON_MIDDLE) gMmbDown = true;
         if (button == GLFW_MOUSE_BUTTON_RIGHT) gRmbDown = true;
+        gSuppressClickPick = hasNavigationGesture();
     } else {
         if (button == GLFW_MOUSE_BUTTON_LEFT) {
             gLmbDown = false;
@@ -2455,7 +2597,7 @@ static void mouseButtonCb(GLFWwindow* window, int button, int action,
             double dy = cy - gClickPressY;
             if (dx * dx + dy * dy < 9.0) {
                 // Only pick on bare LMB (no modifier)
-                if (!gModAlt && !gModShift && !gModCtrl) {
+                if (!gSuppressClickPick && !gModAlt && !gModShift && !gModCtrl && !gModTab) {
                     // Convert cursor pos to TUI cell coordinates
                     int fbW, fbH;
                     glfwGetFramebufferSize(window, &fbW, &fbH);
@@ -2463,8 +2605,8 @@ static void mouseButtonCb(GLFWwindow* window, int button, int action,
                     glfwGetWindowSize(window, &winW2, &winH2);
                     float fbScaleX = (winW2 > 0) ? static_cast<float>(fbW) / static_cast<float>(winW2) : 1.0f;
                     float fbScaleY = (winH2 > 0) ? static_cast<float>(fbH) / static_cast<float>(winH2) : 1.0f;
-                    int cellCol = static_cast<int>(cx * fbScaleX) / kFontGlyphW;
-                    int cellRow = static_cast<int>(cy * fbScaleY) / kFontGlyphH;
+                    int cellCol = static_cast<int>(cx * fbScaleX) / gTuiCellW;
+                    int cellRow = static_cast<int>(cy * fbScaleY) / gTuiCellH;
 
                     // Check if click is on terminal toggle icon [+]/[-]
                     int termTitleRow;
@@ -2487,6 +2629,7 @@ static void mouseButtonCb(GLFWwindow* window, int button, int action,
         }
         if (button == GLFW_MOUSE_BUTTON_MIDDLE) gMmbDown = false;
         if (button == GLFW_MOUSE_BUTTON_RIGHT) gRmbDown = false;
+        if (!gLmbDown && !gMmbDown && !gRmbDown) gSuppressClickPick = false;
     }
 }
 
@@ -2501,11 +2644,48 @@ static void doPan(float dx, float dy) {
     gCamera = cam;
 }
 
-static void doDolly(float dy) {
+static void doDolly(float delta) {
     OrbitCamera& cam = gCameras[gActiveViewport];
-    cam.distance += dy * 0.02f * cam.distance;
+    cam.distance += delta * 0.02f * cam.distance;
     if (cam.distance < 0.1f) cam.distance = 0.1f;
     gCamera = cam;
+}
+
+static void syncModifierState(GLFWwindow* window, int mods) {
+    if (mods >= 0) {
+        gModCtrl = (mods & GLFW_MOD_CONTROL) != 0;
+        gModShift = (mods & GLFW_MOD_SHIFT) != 0;
+        gModAlt = (mods & GLFW_MOD_ALT) != 0;
+    } else {
+        gModCtrl = glfwGetKey(window, GLFW_KEY_LEFT_CONTROL) == GLFW_PRESS ||
+                   glfwGetKey(window, GLFW_KEY_RIGHT_CONTROL) == GLFW_PRESS;
+        gModShift = glfwGetKey(window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS ||
+                    glfwGetKey(window, GLFW_KEY_RIGHT_SHIFT) == GLFW_PRESS;
+        gModAlt = glfwGetKey(window, GLFW_KEY_LEFT_ALT) == GLFW_PRESS ||
+                  glfwGetKey(window, GLFW_KEY_RIGHT_ALT) == GLFW_PRESS;
+    }
+
+    gModTab = glfwGetKey(window, GLFW_KEY_TAB) == GLFW_PRESS;
+}
+
+static bool wantsOrbitNavigation() {
+    return (gModAlt && gLmbDown) ||
+           (gModShift && !gModCtrl && !gModTab && gLmbDown);
+}
+
+static bool wantsPanNavigation() {
+    return (gModAlt && gMmbDown) ||
+           (gModCtrl && !gModShift && !gModTab && gLmbDown);
+}
+
+static bool wantsDollyNavigation() {
+    return (gModAlt && gRmbDown) ||
+           (gModCtrl && gModShift && gLmbDown) ||
+           (gModTab && gLmbDown);
+}
+
+static bool hasNavigationGesture() {
+    return wantsOrbitNavigation() || wantsPanNavigation() || wantsDollyNavigation();
 }
 
 static int hitTestViewport(double cx, double cy, int fbW, int fbH) {
@@ -2525,41 +2705,23 @@ static void cursorPosCb(GLFWwindow* window, double xpos, double ypos) {
     gLastCursorX = xpos;
     gLastCursorY = ypos;
 
-    // Refresh modifier state by polling (fallback for missed key events)
-    gModCtrl  = gModCtrl  || glfwGetKey(window, GLFW_KEY_LEFT_CONTROL) == GLFW_PRESS ||
-                             glfwGetKey(window, GLFW_KEY_RIGHT_CONTROL) == GLFW_PRESS;
-    gModShift = gModShift || glfwGetKey(window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS ||
-                             glfwGetKey(window, GLFW_KEY_RIGHT_SHIFT) == GLFW_PRESS;
-    gModAlt   = gModAlt   || glfwGetKey(window, GLFW_KEY_LEFT_ALT) == GLFW_PRESS ||
-                             glfwGetKey(window, GLFW_KEY_RIGHT_ALT) == GLFW_PRESS;
+    float navScale = getNavigationDeltaScale(window);
+    dx *= navScale;
+    dy *= navScale;
 
-    if (gLmbDown) {
+    syncModifierState(window);
+
+    if (wantsOrbitNavigation()) {
         OrbitCamera& cam = gCameras[gActiveViewport];
-        if (gModCtrl && gModShift) {
-            // Ctrl+Shift+LMB = orbit
-            cam.longitude -= dx * 0.3f;
-            cam.latitude += dy * 0.3f;
-            if (cam.latitude > 89.0f) cam.latitude = 89.0f;
-            if (cam.latitude < -89.0f) cam.latitude = -89.0f;
-        } else if (gModShift) {
-            doPan(dx, dy);
-        } else if (gModCtrl) {
-            doDolly(dy);
-        } else if (gModAlt) {
-            cam.longitude -= dx * 0.3f;
-            cam.latitude += dy * 0.3f;
-            if (cam.latitude > 89.0f) cam.latitude = 89.0f;
-            if (cam.latitude < -89.0f) cam.latitude = -89.0f;
-        }
+        cam.longitude -= dx * 0.3f;
+        cam.latitude += dy * 0.3f;
+        if (cam.latitude > 89.0f) cam.latitude = 89.0f;
+        if (cam.latitude < -89.0f) cam.latitude = -89.0f;
         gCamera = cam;
-    }
-
-    if (gModAlt && gMmbDown) {
+    } else if (wantsPanNavigation()) {
         doPan(dx, dy);
-    }
-
-    if (gModAlt && gRmbDown) {
-        doDolly(dy);
+    } else if (wantsDollyNavigation()) {
+        doDolly(dx);
     }
 }
 
@@ -2636,32 +2798,28 @@ int main(int argc, char** argv) {
     } else {
         glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
     }
+#ifdef GLFW_SCALE_TO_MONITOR
+    glfwWindowHint(GLFW_SCALE_TO_MONITOR, GLFW_TRUE);
+#endif
 
     int winW = 800, winH = 600;
     GLFWmonitor* primary = glfwGetPrimaryMonitor();
-    float contentScale = 1.0f;
     if (primary) {
         float xscale = 1.0f, yscale = 1.0f;
         glfwGetMonitorContentScale(primary, &xscale, &yscale);
-        contentScale = xscale;
 
         const GLFWvidmode* mode = glfwGetVideoMode(primary);
         if (mode) {
-            int rawW = mode->width;
-            int scaledW = static_cast<int>(static_cast<float>(rawW) * xscale);
-            int physicalW = rawW > scaledW ? rawW : scaledW;
-            std::printf("Monitor: %dx%d, content scale: %.2f "
-                        "(physical ~%d px wide)\n",
-                        mode->width, mode->height, xscale, physicalW);
-            if (physicalW >= 3840) {
+            std::printf("Monitor: %dx%d, content scale: %.2f x %.2f\n",
+                        mode->width, mode->height, xscale, yscale);
+            if (mode->width >= 3840 || mode->height >= 2160) {
                 winW = 1600;
                 winH = 1200;
+            } else if (mode->width >= 2560 || mode->height >= 1440) {
+                winW = 1280;
+                winH = 960;
             }
         }
-    }
-    if (contentScale > 1.0f) {
-        winW = static_cast<int>(static_cast<float>(winW) / contentScale);
-        winH = static_cast<int>(static_cast<float>(winH) / contentScale);
     }
 
     GLFWwindow* window =
@@ -2671,6 +2829,8 @@ int main(int argc, char** argv) {
         glfwTerminate();
         return EXIT_FAILURE;
     }
+
+    updateDisplayScaling(window, primary, "startup");
 
     {
         int fbW, fbH;
@@ -2686,6 +2846,9 @@ int main(int argc, char** argv) {
     glfwSetCursorPosCallback(window, cursorPosCb);
     glfwSetScrollCallback(window, scrollCb);
     glfwSetCharCallback(window, charCb);
+#if GLFW_VERSION_MAJOR > 3 || (GLFW_VERSION_MAJOR == 3 && GLFW_VERSION_MINOR >= 3)
+    glfwSetWindowContentScaleCallback(window, windowContentScaleCb);
+#endif
 
     // -----------------------------------------------------------------------
     // Build vertex data (shared between backends)
@@ -3097,7 +3260,8 @@ int main(int argc, char** argv) {
     }
     termLog("Controls: 4-9,0=Mode  V=Viewport  A=FitAll  F=FitSel");
     termLog("  LMB click=Select, Space=Play/Pause, :mode 11=MatID, :mode 0=Tangent");
-    termLog("  Alt+LMB=Orbit, Shift+LMB=Pan, Ctrl+LMB=Dolly, Scroll=Dolly");
+    termLog("  Alt+LMB/Shift+LMB=Orbit, Alt+MMB/Ctrl+LMB=Pan");
+    termLog("  Alt+RMB/Ctrl+Shift+LMB/Tab+LMB=Zoom, Scroll=Zoom");
 
     // Initialize multi-camera array from current gCamera
     gCameras[0] = gCamera;
