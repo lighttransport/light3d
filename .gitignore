@@ -75,3 +75,9 @@ Makefile
 *.js
 *.html
 !examples/shell.html
+
+# Third-party dependencies (fetched via setup_deps.sh)
+deps/
+
+# Headless test screenshots
+tests/headless/*.png
