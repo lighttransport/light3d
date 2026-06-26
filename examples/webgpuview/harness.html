@@ -1,0 +1,474 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>light3d — file-neutral WebGPU harness (skinning / blendshape / PBR)</title>
+<style>
+  :root { color-scheme: dark; }
+  html,body { margin:0; height:100%; background:#0d1017; overflow:hidden; }
+  #c { width:100%; height:100%; display:block; }
+  #overlay,#help { position:fixed; left:10px; font:12px/1.5 ui-monospace,Menlo,Consolas,monospace; color:#cfe; background:rgba(8,12,20,.6); padding:6px 9px; border-radius:6px; pointer-events:none; white-space:pre; }
+  #overlay { top:10px; } #help { bottom:10px; color:#9ab; }
+  #drop { position:fixed; inset:0; display:none; align-items:center; justify-content:center; background:rgba(20,40,80,.4); color:#fff; font:600 20px ui-monospace; }
+  #drop.on { display:flex; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="overlay">initializing…</div>
+<div id="help">1 RiggedSimple · 2 AnimatedMorphCube · 3 BoxTextured · drag-drop .glb/.gltf · P pause-anim · M morph-anim · drag orbit · scroll zoom</div>
+<div id="drop">drop a .glb / .gltf</div>
+
+<script type="module">
+// ============================================================================
+//  Minimal column-major mat4 / vec3 math
+// ============================================================================
+const M = {
+  id:()=>{const m=new Float32Array(16);m[0]=m[5]=m[10]=m[15]=1;return m;},
+  mul:(a,b)=>{const o=new Float32Array(16);for(let c=0;c<4;c++)for(let r=0;r<4;r++){let s=0;for(let k=0;k<4;k++)s+=a[k*4+r]*b[c*4+k];o[c*4+r]=s;}return o;},
+  persp:(fov,asp,n,f)=>{const t=1/Math.tan(fov/2);const m=new Float32Array(16);m[0]=t/asp;m[5]=t;m[10]=f/(n-f);m[11]=-1;m[14]=f*n/(n-f);return m;}, // WebGPU z∈[0,1]
+  look:(eye,ctr,up)=>{const z=V.norm(V.sub(eye,ctr));const x=V.norm(V.cross(up,z));const y=V.cross(z,x);
+    return new Float32Array([x[0],y[0],z[0],0, x[1],y[1],z[1],0, x[2],y[2],z[2],0, -V.dot(x,eye),-V.dot(y,eye),-V.dot(z,eye),1]);},
+};
+const V = {
+  sub:(a,b)=>[a[0]-b[0],a[1]-b[1],a[2]-b[2]], add:(a,b)=>[a[0]+b[0],a[1]+b[1],a[2]+b[2]],
+  dot:(a,b)=>a[0]*b[0]+a[1]*b[1]+a[2]*b[2], cross:(a,b)=>[a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]],
+  scale:(a,s)=>[a[0]*s,a[1]*s,a[2]*s], len:a=>Math.hypot(a[0],a[1],a[2]),
+  norm:a=>{const l=Math.hypot(a[0],a[1],a[2])||1;return [a[0]/l,a[1]/l,a[2]/l];},
+};
+
+// ============================================================================
+//  glTF skeletal animation (sample TRS curves → joint world → skinning matrices)
+// ============================================================================
+function trsMat(t,r,s){ // column-major, matches the C-side node local matrix
+  const x=r[0],y=r[1],z=r[2],w=r[3];
+  const xx=x*x,yy=y*y,zz=z*z,xy=x*y,xz=x*z,yz=y*z,wx=w*x,wy=w*y,wz=w*z;
+  const m=new Float32Array(16);
+  m[0]=(1-2*(yy+zz))*s[0]; m[1]=(2*(xy+wz))*s[0];   m[2]=(2*(xz-wy))*s[0];   m[3]=0;
+  m[4]=(2*(xy-wz))*s[1];   m[5]=(1-2*(xx+zz))*s[1]; m[6]=(2*(yz+wx))*s[1];   m[7]=0;
+  m[8]=(2*(xz+wy))*s[2];   m[9]=(2*(yz-wx))*s[2];   m[10]=(1-2*(xx+yy))*s[2];m[11]=0;
+  m[12]=t[0]; m[13]=t[1]; m[14]=t[2]; m[15]=1; return m;
+}
+function qslerp(a,b,t){
+  let d=a[0]*b[0]+a[1]*b[1]+a[2]*b[2]+a[3]*b[3]; let bb=b;
+  if(d<0){d=-d; bb=[-b[0],-b[1],-b[2],-b[3]];}
+  if(d>0.9995){ const r=[a[0]+t*(bb[0]-a[0]),a[1]+t*(bb[1]-a[1]),a[2]+t*(bb[2]-a[2]),a[3]+t*(bb[3]-a[3])]; const l=Math.hypot(r[0],r[1],r[2],r[3])||1; return [r[0]/l,r[1]/l,r[2]/l,r[3]/l]; }
+  const th=Math.acos(d), s=Math.sin(th), wa=Math.sin((1-t)*th)/s, wb=Math.sin(t*th)/s;
+  return [wa*a[0]+wb*bb[0], wa*a[1]+wb*bb[1], wa*a[2]+wb*bb[2], wa*a[3]+wb*bb[3]];
+}
+function sampleChannel(ch,t){
+  const times=ch.times, vals=ch.values, n=times.length;
+  const comp = ch.path==='rotation'?4 : (ch.path==='weights'? (vals.length/n)|0 : 3);
+  const cub = ch.interp==='CUBICSPLINE', stride = cub?comp*3:comp;
+  const valAt=(i)=>{ const o=i*stride+(cub?comp:0); return Array.from(vals.subarray(o,o+comp)); };
+  if(n===0) return null;
+  if(t<=times[0]) return valAt(0);
+  if(t>=times[n-1]) return valAt(n-1);
+  let i=0; while(i<n-1 && times[i+1]<t) i++;
+  const f=(t-times[i])/((times[i+1]-times[i])||1), a=valAt(i), b=valAt(i+1);
+  if(ch.interp==='STEP') return a;
+  if(ch.path==='rotation') return qslerp(a,b,f);
+  return a.map((x,k)=>x+(b[k]-x)*f);
+}
+let A = null;                 // animation state (null if scene has no animation)
+let animPlaying = true;
+function setupAnim(scene){
+  A = null;
+  if(!(scene.nodes && scene.nodes.length && scene.animations && scene.animations.length)) return;
+  const nodes = scene.nodes.map(n=>({ t0:Array.from(n.t), r0:Array.from(n.r), s0:Array.from(n.s),
+    t:Array.from(n.t), r:Array.from(n.r), s:Array.from(n.s),
+    hasMatrix:n.hasMatrix, matrix:n.hasMatrix?new Float32Array(n.matrix):null, children:n.children }));
+  const parent = new Array(nodes.length).fill(-1);
+  nodes.forEach((n,i)=>n.children.forEach(c=>{ if(c>=0&&c<nodes.length) parent[c]=i; }));
+  const skins = scene.skins.map(s=>({ joints:Array.from(s.joints), ibm:s.inverseBindMatrices }));
+  A = { nodes, parent, skins, anim: scene.animations[0], clock:0, skinMats:[] };
+}
+function computeWorlds(){
+  const N=A.nodes.length, world=new Array(N), done=new Array(N).fill(false);
+  const calc=(i)=>{ if(done[i])return; const n=A.nodes[i];
+    const local = n.hasMatrix? n.matrix : trsMat(n.t,n.r,n.s);
+    world[i] = A.parent[i]>=0 ? (calc(A.parent[i]), M.mul(world[A.parent[i]], local)) : local;
+    done[i]=true; };
+  for(let i=0;i<N;i++) calc(i); return world;
+}
+function animateAndReskin(dt){
+  if(!A || !A.anim || !animPlaying) return;
+  A.clock += dt; reskinAt(A.clock % (A.anim.duration||1));
+}
+function reskinAt(t){
+  if(!A || !A.anim) return;
+  for(const n of A.nodes){ n.t=n.t0.slice(); n.r=n.r0.slice(); n.s=n.s0.slice(); }
+  for(const ch of A.anim.channels){ if(ch.node<0||ch.path==='weights')continue; const v=sampleChannel(ch,t); if(!v)continue;
+    const n=A.nodes[ch.node];
+    if(ch.path==='translation') n.t=v; else if(ch.path==='rotation') n.r=v; else if(ch.path==='scale') n.s=v; }
+  const world=computeWorlds();
+  for(let s=0;s<A.skins.length;s++){ const sk=A.skins[s], jc=sk.joints.length, sm=new Float32Array(jc*16);
+    for(let j=0;j<jc;j++){ const jw=world[sk.joints[j]]||M.id(); sm.set(M.mul(jw, sk.ibm.subarray(j*16,j*16+16)), j*16); }
+    A.skinMats[s]=sm; }
+  for(const d of drawList){ if(d.skinned && d.skinIndex>=0 && A.skinMats[d.skinIndex]) device.queue.writeBuffer(d.bones,0,A.skinMats[d.skinIndex]); }
+}
+
+// ============================================================================
+//  WGSL — one pipeline does morph (storage deltas) → skinning (bone storage) → PBR (GGX)
+// ============================================================================
+const WGSL = /* wgsl */`
+struct U {
+  viewProj : mat4x4f,
+  model    : mat4x4f,
+  camPos   : vec4f,
+  lightDir : vec4f,
+  baseColor: vec4f,
+  params   : vec4f,   // x=metallic y=roughness z=morphCount w=skinned
+  emissive : vec4f,   // xyz=emissive  w=vertexCount
+};
+@group(0) @binding(0) var<uniform> u : U;
+@group(0) @binding(1) var<storage,read> bones : array<mat4x4f>;
+@group(0) @binding(2) var<storage,read> morph : array<f32>;       // [(t*vc+v)*3 + c]
+@group(0) @binding(3) var<uniform> mw : array<vec4f, 16>;          // up to 64 morph weights
+
+struct VIn {
+  @location(0) pos:vec3f, @location(1) normal:vec3f, @location(2) uv:vec2f,
+  @location(3) joints:vec4f, @location(4) weights:vec4f,
+};
+struct VOut { @builtin(position) clip:vec4f, @location(0) world:vec3f, @location(1) normal:vec3f, @location(2) uv:vec2f };
+
+@vertex fn vs(in:VIn, @builtin(vertex_index) vid:u32) -> VOut {
+  var p = in.pos;
+  var n = in.normal;
+  let mc = u32(u.params.z);
+  let vc = u32(u.emissive.w);
+  for (var t=0u; t<mc; t++) {
+    let w = mw[t/4u][t%4u];
+    if (w != 0.0) { let b=(t*vc+vid)*3u; p += w*vec3f(morph[b],morph[b+1u],morph[b+2u]); }
+  }
+  var world : vec4f;
+  if (u.params.w > 0.5) {
+    var sp = vec4f(0.0); var sn = vec3f(0.0);
+    for (var k=0u;k<4u;k++) {
+      let bm = bones[u32(in.joints[k])];
+      sp += in.weights[k] * (bm * vec4f(p,1.0));
+      sn += in.weights[k] * (mat3x3f(bm[0].xyz,bm[1].xyz,bm[2].xyz) * n);
+    }
+    world = sp; n = sn;
+  } else {
+    world = u.model * vec4f(p,1.0);
+    n = (u.model * vec4f(n,0.0)).xyz;
+  }
+  var o:VOut; o.clip = u.viewProj * world; o.world = world.xyz; o.normal = n; o.uv = in.uv; return o;
+}
+
+const PI = 3.14159265359;
+@fragment fn fs(i:VOut) -> @location(0) vec4f {
+  let N = normalize(i.normal);
+  let Vv = normalize(u.camPos.xyz - i.world);
+  let L = normalize(u.lightDir.xyz);
+  let H = normalize(L + Vv);
+  let base = u.baseColor.rgb;
+  let metallic = u.params.x; let rough = clamp(u.params.y, 0.04, 1.0);
+  let F0 = mix(vec3f(0.04), base, metallic);
+  let NoH=max(dot(N,H),0.0); let NoV=max(dot(N,Vv),1e-4); let NoL=max(dot(N,L),0.0); let VoH=max(dot(Vv,H),0.0);
+  let a=rough*rough; let a2=a*a; let dn=NoH*NoH*(a2-1.0)+1.0;
+  let D=a2/(PI*dn*dn);
+  let kg=(rough+1.0)*(rough+1.0)/8.0;
+  let G=(NoV/(NoV*(1.0-kg)+kg))*(NoL/(NoL*(1.0-kg)+kg));
+  let F=F0+(1.0-F0)*pow(1.0-VoH,5.0);
+  let spec=D*G*F/(4.0*NoV*NoL+1e-4);
+  let kd=(vec3f(1.0)-F)*(1.0-metallic);
+  let radiance=vec3f(2.5);
+  var color = (kd*base/PI + spec)*radiance*NoL + base*0.06 + u.emissive.rgb;
+  color = color/(color+vec3f(1.0));               // Reinhard
+  return vec4f(pow(color, vec3f(1.0/2.2)), 1.0);  // gamma
+}`;
+
+// ============================================================================
+//  Boot WebGPU + module
+// ============================================================================
+const overlay = document.getElementById('overlay');
+const canvas = document.getElementById('c');
+let device, ctx, fmt, depthTex, pipeline;
+let lightusd = null;
+
+async function ensureModule() {
+  if (lightusd) return lightusd;
+  if (!window.LightUSD) {
+    await new Promise((res,rej)=>{ const s=document.createElement('script'); s.src='lightusd.js'; s.onload=res; s.onerror=()=>rej(new Error('lightusd.js load failed')); document.head.appendChild(s); });
+  }
+  lightusd = await window.LightUSD();
+  return lightusd;
+}
+
+async function initGPU() {
+  if (!navigator.gpu) { overlay.textContent='WebGPU not supported'; throw new Error('no webgpu'); }
+  const adapter = await navigator.gpu.requestAdapter({ powerPreference:'high-performance' });
+  device = await adapter.requestDevice();
+  ctx = canvas.getContext('webgpu');
+  fmt = navigator.gpu.getPreferredCanvasFormat();
+  const mod = device.createShaderModule({ code: WGSL });
+  pipeline = device.createRenderPipeline({
+    layout:'auto',
+    vertex:{ module:mod, entryPoint:'vs', buffers:[
+      { arrayStride:32, attributes:[
+        {shaderLocation:0,offset:0,format:'float32x3'},
+        {shaderLocation:1,offset:12,format:'float32x3'},
+        {shaderLocation:2,offset:24,format:'float32x2'}]},
+      { arrayStride:32, attributes:[
+        {shaderLocation:3,offset:0,format:'float32x4'},
+        {shaderLocation:4,offset:16,format:'float32x4'}]},
+    ]},
+    fragment:{ module:mod, entryPoint:'fs', targets:[{format:fmt}] },
+    primitive:{ topology:'triangle-list', cullMode:'none' },
+    depthStencil:{ format:'depth24plus', depthWriteEnabled:true, depthCompare:'less' },
+  });
+  resize();
+  window.addEventListener('resize', resize);
+}
+function resize() {
+  canvas.width = Math.max(1, canvas.clientWidth|0);
+  canvas.height = Math.max(1, canvas.clientHeight|0);
+  ctx.configure({ device, format:fmt, alphaMode:'premultiplied' });
+  depthTex?.destroy();
+  depthTex = device.createTexture({ size:[canvas.width,canvas.height], format:'depth24plus', usage:GPUTextureUsage.RENDER_ATTACHMENT });
+}
+
+// ============================================================================
+//  Build GPU resources from the neutral scene
+// ============================================================================
+let drawList = [];           // {vbuf,jwbuf,ibuf,count,bones,morph,morphCount,vc,nodeMatrix,skinned,material,bbox,morphTargets}
+let sceneBBox = null;
+let morphAnim = true;   // morph-target animation on by default
+
+function buf(usage, src) { const b=device.createBuffer({size:Math.max(16,src.byteLength),usage}); device.queue.writeBuffer(b,0,src); return b; }
+
+function buildScene(scene) {
+  for (const d of drawList) { d.vbuf.destroy(); d.jwbuf.destroy(); d.ibuf.destroy(); d.bones.destroy(); d.morph.destroy(); }
+  drawList = [];
+  let mn=[1e30,1e30,1e30], mx=[-1e30,-1e30,-1e30];
+
+  for (const m of scene.meshes) {
+    const vc = m.vertexCount;
+    // joints+weights interleaved (8 floats); zeros if unskinned
+    const jw = new Float32Array(vc*8);
+    if (m.skin.hasSkin) {
+      const ji=m.skin.jointIndices, jwt=m.skin.jointWeights;
+      for (let v=0; v<vc; v++) { for(let k=0;k<4;k++){ jw[v*8+k]=ji[v*4+k]; jw[v*8+4+k]=jwt[v*4+k]; } }
+    }
+    // bone matrices (skinningMatrices) or identity
+    let bones = M.id();
+    if (m.skin.hasSkin && scene.skins[m.skin.skinIndex]) bones = scene.skins[m.skin.skinIndex].skinningMatrices;
+    // morph deltas concatenated
+    let morphData = new Float32Array(4);
+    const morphTargets = (m.morph && m.morph.count>0) ? m.morph.targets : [];
+    if (morphTargets.length) {
+      morphData = new Float32Array(morphTargets.length * vc * 3);
+      for (let t=0;t<morphTargets.length;t++) morphData.set(morphTargets[t], t*vc*3);
+    }
+    drawList.push({
+      vbuf: buf(GPUBufferUsage.VERTEX|GPUBufferUsage.COPY_DST, m.vertices),
+      jwbuf: buf(GPUBufferUsage.VERTEX|GPUBufferUsage.COPY_DST, jw),
+      ibuf: buf(GPUBufferUsage.INDEX|GPUBufferUsage.COPY_DST, m.indices),
+      count: m.indices.length,
+      bones: buf(GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST, bones),
+      morph: buf(GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST, morphData),
+      morphCount: morphTargets.length, vc,
+      nodeMatrix: m.nodeMatrix, skinned: m.skin.hasSkin ? 1 : 0,
+      skinIndex: m.skin.hasSkin ? m.skin.skinIndex : -1,
+      material: m.material, bbox: m.bbox,
+    });
+    // Fit to the ACTUAL rendered positions (skinned bind pose / node-transformed), not raw.
+    const sm = m.skin.hasSkin && scene.skins[m.skin.skinIndex] ? scene.skins[m.skin.skinIndex].skinningMatrices : null;
+    const ji = m.skin.hasSkin ? m.skin.jointIndices : null, jwt = m.skin.hasSkin ? m.skin.jointWeights : null;
+    const nmat = m.nodeMatrix;
+    const xf = (p)=>{ // p=[x,y,z]
+      if (sm) { const o=[0,0,0,0]; for(let k=0;k<4;k++){const j=ji[p.v*4+k],w=jwt[p.v*4+k]; if(!w)continue;
+          for(let r=0;r<4;r++){let s=0;for(let c=0;c<4;c++)s+=sm[j*16+c*4+r]*[p[0],p[1],p[2],1][c];o[r]+=w*s;}} return o; }
+      const o=[0,0,0]; for(let r=0;r<3;r++)o[r]=nmat[0*4+r]*p[0]+nmat[1*4+r]*p[1]+nmat[2*4+r]*p[2]+nmat[3*4+r]; return o; };
+    for (let v=0; v<vc; v++) { const wp=xf(Object.assign([m.vertices[v*8],m.vertices[v*8+1],m.vertices[v*8+2]],{v}));
+      mn=[Math.min(mn[0],wp[0]),Math.min(mn[1],wp[1]),Math.min(mn[2],wp[2])];
+      mx=[Math.max(mx[0],wp[0]),Math.max(mx[1],wp[1]),Math.max(mx[2],wp[2])]; }
+  }
+  sceneBBox = {min:mn,max:mx};
+  cam.target = V.scale(V.add(mn,mx),0.5);
+  cam.dist = Math.max(0.5, V.len(V.sub(mx,mn))*1.4);
+  setupAnim(scene);
+  const skinned = drawList.filter(d=>d.skinned).length, morphs = drawList.filter(d=>d.morphCount>0).length;
+  const anim = A && A.anim ? ` · anim:${A.anim.name}(${A.anim.duration.toFixed(1)}s)` : '';
+  overlay.textContent = `${drawList.length} mesh(es) · skinned:${skinned} · morph:${morphs}${anim} · ${currentName}`;
+}
+
+// ============================================================================
+//  Orbit camera + render loop
+// ============================================================================
+const cam = { lon:35, lat:20, dist:5, target:[0,0,0] };
+function camEye() {
+  const la=cam.lat*Math.PI/180, lo=cam.lon*Math.PI/180;
+  return V.add(cam.target, [cam.dist*Math.cos(la)*Math.sin(lo), cam.dist*Math.sin(la), cam.dist*Math.cos(la)*Math.cos(lo)]);
+}
+let frameCount = 0;
+// ---- Headless test / automation interface (used by Firefox MCP; see doc/testing.md) ----
+// rAF is throttled in headless, so tests render on demand and read pixels back.
+window.__dbg = () => ({ frameCount, frameErr: window.__frameErr||null, w:canvas.width, h:canvas.height,
+  draws: drawList.length, ready: !!window.__harnessReady, err: window.__harnessError||null, name: currentName });
+window.__renderOnce = () => renderOnce();   // headless: rAF is throttled, so render on demand
+window.__seekAnim = (t) => { if(A){ A.clock=t; reskinAt(t); } return A?{clock:A.clock, dur:A.anim.duration,
+  skin0: A.skinMats[0]?Array.from(A.skinMats[0]).map(x=>+x.toFixed(3)):null}:null; };
+window.__pauseAnim = (p) => { animPlaying = !p; };
+
+// Headless-proof verification: render the current scene to an offscreen texture and read pixels.
+window.__renderOffscreen = async (W=512, H=512, morphW=null) => {
+  device.pushErrorScope('validation');
+  const tex = device.createTexture({ size:[W,H], format:fmt, usage:GPUTextureUsage.RENDER_ATTACHMENT|GPUTextureUsage.COPY_SRC });
+  const bgra = (fmt === 'bgra8unorm');
+  const dep = device.createTexture({ size:[W,H], format:'depth24plus', usage:GPUTextureUsage.RENDER_ATTACHMENT });
+  const eye = camEye();
+  const view = M.look(eye, cam.target, [0,1,0]);
+  const proj = M.persp(50*Math.PI/180, W/H, 0.01, 1000);
+  const viewProj = M.mul(proj, view);
+  const lightDir = V.norm([0.4,0.8,0.6]);
+  const enc = device.createCommandEncoder();
+  const pass = enc.beginRenderPass({
+    colorAttachments:[{ view:tex.createView(), clearValue:{r:0.05,g:0.06,b:0.09,a:1}, loadOp:'clear', storeOp:'store' }],
+    depthStencilAttachment:{ view:dep.createView(), depthClearValue:1, depthLoadOp:'clear', depthStoreOp:'store' },
+  });
+  pass.setPipeline(pipeline);
+  const tmpB = [];
+  for (const d of drawList) {
+    const ub = new Float32Array(64);
+    ub.set(viewProj,0); ub.set(d.nodeMatrix,16); ub.set([eye[0],eye[1],eye[2],1],32);
+    ub.set([lightDir[0],lightDir[1],lightDir[2],0],36);
+    ub.set([d.material.baseColor[0],d.material.baseColor[1],d.material.baseColor[2],1],40);
+    ub.set([d.material.metallic,d.material.roughness,d.morphCount,d.skinned],44);
+    ub.set([d.material.emissive[0],d.material.emissive[1],d.material.emissive[2],d.vc],48);
+    const uBuf = buf(GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST, ub);
+    const mw = new Float32Array(64);
+    for (let t=0;t<d.morphCount;t++) mw[t] = morphW!=null ? (t===0?morphW:0) : (t===0?1:0);
+    const mwBuf = buf(GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST, mw);
+    const bg = device.createBindGroup({ layout:pipeline.getBindGroupLayout(0), entries:[
+      {binding:0,resource:{buffer:uBuf}},{binding:1,resource:{buffer:d.bones}},
+      {binding:2,resource:{buffer:d.morph}},{binding:3,resource:{buffer:mwBuf}} ]});
+    pass.setVertexBuffer(0,d.vbuf); pass.setVertexBuffer(1,d.jwbuf);
+    pass.setIndexBuffer(d.ibuf,'uint32'); pass.setBindGroup(0,bg); pass.drawIndexed(d.count);
+    tmpB.push(uBuf, mwBuf);
+  }
+  pass.end();
+  const bpr = Math.ceil(W*4/256)*256;
+  const rb = device.createBuffer({ size:bpr*H, usage:GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ });
+  enc.copyTextureToBuffer({texture:tex},{buffer:rb,bytesPerRow:bpr},[W,H]);
+  device.queue.submit([enc.finish()]);
+  for (const b of tmpB) b.destroy();
+  await rb.mapAsync(GPUMapMode.READ);
+  const px = new Uint8Array(rb.getMappedRange().slice(0));
+  // stats: fraction of non-background pixels + average foreground color
+  let fg=0, sr=0,sg=0,sb=0, cxs=0, cys=0;
+  for (let y=0;y<H;y++) for (let x=0;x<W;x++){ const o=y*bpr+x*4;
+    const r=bgra?px[o+2]:px[o], g=px[o+1], b=bgra?px[o]:px[o+2];
+    if (r+g+b > 90){ fg++; sr+=r; sg+=g; sb+=b; cxs+=x; cys+=y; } }   // model surfaces are lit/brighter than the dark clear (~51)
+  rb.unmap(); rb.destroy(); tex.destroy(); dep.destroy();
+  const verr = await device.popErrorScope();
+  return { W,H, coverage:+(fg/(W*H)).toFixed(4), avgFg: fg? [Math.round(sr/fg),Math.round(sg/fg),Math.round(sb/fg)]:[0,0,0],
+    centroid: fg? [+(cxs/fg).toFixed(1),+(cys/fg).toFixed(1)]:null, err: verr?verr.message:null };
+};
+// rAF drives compositing in headless; renderOnce() is guarded so a draw error can't break the chain.
+function frame() { renderOnce(); requestAnimationFrame(frame); }
+function renderOnce() {
+  frameCount++;
+  try {
+  animateAndReskin(1/60);   // advance skeletal animation (works under rAF and on-demand)
+  const eye = camEye();
+  const view = M.look(eye, cam.target, [0,1,0]);
+  const proj = M.persp(50*Math.PI/180, canvas.width/canvas.height, 0.01, 1000);
+  const viewProj = M.mul(proj, view);
+  const lightDir = V.norm([0.4,0.8,0.6]);
+
+  const enc = device.createCommandEncoder();
+  const pass = enc.beginRenderPass({
+    colorAttachments:[{ view:ctx.getCurrentTexture().createView(), clearValue:{r:0.05,g:0.06,b:0.09,a:1}, loadOp:'clear', storeOp:'store' }],
+    depthStencilAttachment:{ view:depthTex.createView(), depthClearValue:1, depthLoadOp:'clear', depthStoreOp:'store' },
+  });
+  pass.setPipeline(pipeline);
+  const tmp = [];
+  for (const d of drawList) {
+    // uniforms (256 bytes)
+    const ub = new Float32Array(64);
+    ub.set(viewProj, 0); ub.set(d.nodeMatrix, 16);
+    ub.set([eye[0],eye[1],eye[2],1], 32);
+    ub.set([lightDir[0],lightDir[1],lightDir[2],0], 36);
+    ub.set([d.material.baseColor[0],d.material.baseColor[1],d.material.baseColor[2],1], 40);
+    ub.set([d.material.metallic, d.material.roughness, d.morphCount, d.skinned], 44);
+    ub.set([d.material.emissive[0],d.material.emissive[1],d.material.emissive[2], d.vc], 48);
+    const uBuf = buf(GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST, ub);
+    // morph weights (up to 64) — animate target 0 when enabled
+    const mwArr = new Float32Array(64);
+    for (let t=0;t<d.morphCount;t++) {
+      mwArr[t] = morphAnim ? (t===0 ? 0.5+0.5*Math.sin(frameCount*0.04) : 0) : (t===0?1:0);
+    }
+    const mwBuf = buf(GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST, mwArr);
+    tmp.push(uBuf, mwBuf);
+
+    const bg = device.createBindGroup({ layout:pipeline.getBindGroupLayout(0), entries:[
+      {binding:0,resource:{buffer:uBuf}}, {binding:1,resource:{buffer:d.bones}},
+      {binding:2,resource:{buffer:d.morph}}, {binding:3,resource:{buffer:mwBuf}} ]});
+    pass.setVertexBuffer(0, d.vbuf);
+    pass.setVertexBuffer(1, d.jwbuf);
+    pass.setIndexBuffer(d.ibuf, 'uint32');
+    pass.setBindGroup(0, bg);
+    pass.drawIndexed(d.count);
+  }
+  pass.end();
+  device.queue.submit([enc.finish()]);  // destroy transient buffers only AFTER submit
+  for (const b of tmp) b.destroy();
+  } catch (e) { window.__frameErr = (e.message||String(e)); }
+}
+
+// ============================================================================
+//  Loading (glTF via tinygltf-v3 WASM → neutral scene)
+// ============================================================================
+let currentName = '(none)';
+async function loadGltfBuffer(name, arrayBuffer) {
+  const mod = await ensureModule();
+  const scene = mod.loadGltfFromMemory(new Uint8Array(arrayBuffer));
+  if (!scene) { overlay.textContent = 'glTF parse failed: ' + name; return null; }
+  currentName = name;
+  buildScene(scene);
+  return scene;
+}
+async function loadGltfUrl(url) {
+  const buf = await (await fetch(url)).arrayBuffer();
+  return loadGltfBuffer(url.split('/').pop(), buf);
+}
+window.loadGltfUrl = loadGltfUrl;
+window.loadGltfBuffer = loadGltfBuffer;
+window.__harness = { get drawList(){return drawList;}, get bbox(){return sceneBBox;}, get name(){return currentName;}, setMorphAnim:v=>morphAnim=v };
+
+// input
+let drag=null;
+canvas.addEventListener('pointerdown', e=>{ drag={x:e.clientX,y:e.clientY}; canvas.setPointerCapture(e.pointerId); });
+canvas.addEventListener('pointerup', ()=>drag=null);
+canvas.addEventListener('pointermove', e=>{ if(!drag)return; cam.lon-=(e.clientX-drag.x)*0.4; cam.lat=Math.max(-89,Math.min(89,cam.lat+(e.clientY-drag.y)*0.4)); drag={x:e.clientX,y:e.clientY}; });
+canvas.addEventListener('wheel', e=>{ e.preventDefault(); cam.dist*=Math.exp(e.deltaY*0.001); }, {passive:false});
+addEventListener('keydown', e=>{
+  if(e.key==='1') loadGltfUrl('models/RiggedSimple.glb');
+  else if(e.key==='2') loadGltfUrl('models/AnimatedMorphCube.glb');
+  else if(e.key==='3') loadGltfUrl('models/BoxTextured.glb');
+  else if(e.key.toLowerCase()==='m') morphAnim=!morphAnim;
+  else if(e.key.toLowerCase()==='p') animPlaying=!animPlaying;
+});
+const drop=document.getElementById('drop');
+addEventListener('dragover',e=>{e.preventDefault();drop.classList.add('on');});
+addEventListener('dragleave',()=>drop.classList.remove('on'));
+addEventListener('drop',async e=>{ e.preventDefault(); drop.classList.remove('on'); const f=e.dataTransfer.files[0]; if(f) loadGltfBuffer(f.name, await f.arrayBuffer()); });
+
+// boot
+(async () => {
+  try {
+    await initGPU();
+    await loadGltfUrl('models/RiggedSimple.glb');  // default
+    requestAnimationFrame(frame);
+    window.__harnessReady = true;
+  } catch (e) {
+    overlay.textContent = 'Error: ' + (e.message||e);
+    window.__harnessError = e.message||String(e);
+  }
+})();
+</script>
+</body>
+</html>

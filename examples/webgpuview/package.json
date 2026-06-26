@@ -1,0 +1,15 @@
+{
+  "name": "lightusd-webgpuview",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "light3d WebGPU viewer + file-neutral skinning/blendshape/PBR harness (USD via lightusd-c, glTF via tinygltf v3)",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview --port 8000"
+  },
+  "devDependencies": {
+    "vite": "^6.0.0"
+  }
+}

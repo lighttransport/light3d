@@ -536,15 +536,18 @@ async function main() {
       const m = meshes[i];
       const srcVerts = m.vertices; // Float32Array, 8 floats per vertex
       const vc = m.vertexCount;
+      // Use the resolved PBR baseColor as vertex color when a material is bound.
+      const mat = m.material || {};
+      const col = (mat.hasMaterial && mat.baseColor) ? mat.baseColor : [0.8, 0.8, 0.8];
       const dstVerts = new Float32Array(vc * S);
       for (let v = 0; v < vc; v++) {
         const si = v * 8, di = v * S;
         dstVerts[di+0] = srcVerts[si+0]; // pos x
         dstVerts[di+1] = srcVerts[si+1]; // pos y
         dstVerts[di+2] = srcVerts[si+2]; // pos z
-        dstVerts[di+3] = 0.8;            // color r
-        dstVerts[di+4] = 0.8;            // color g
-        dstVerts[di+5] = 0.8;            // color b
+        dstVerts[di+3] = col[0];         // color r (PBR baseColor)
+        dstVerts[di+4] = col[1];         // color g
+        dstVerts[di+5] = col[2];         // color b
         dstVerts[di+6] = srcVerts[si+3]; // normal x
         dstVerts[di+7] = srcVerts[si+4]; // normal y
         dstVerts[di+8] = srcVerts[si+5]; // normal z

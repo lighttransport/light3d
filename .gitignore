@@ -75,9 +75,22 @@ Makefile
 *.js
 *.html
 !examples/shell.html
+!examples/webgpuview/tests/*.html
+!examples/webgpuview/harness.html
+!examples/webgpuview/vite.config.js
 
 # Third-party dependencies (fetched via setup_deps.sh)
 deps/
 
 # Headless test screenshots
 tests/headless/*.png
+
+# Node / Vite (examples/webgpuview)
+node_modules/
+examples/webgpuview/dist/
+
+# CMake/emscripten build output
+examples/webgpuview/wasm/build/
+
+# Proprietary / local-only sample assets (never commit)
+examples/webgpuview/dragon-head-only.usdc

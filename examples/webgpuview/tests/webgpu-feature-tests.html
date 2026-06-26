@@ -1,0 +1,802 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>light3d — WebGPU feature tests (skinning / blendshapes / PBR)</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin:0; font:13px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+         background:#10141c; color:#dfe6ee; }
+  header { padding:14px 18px; border-bottom:1px solid #232b39; }
+  h1 { margin:0 0 4px; font-size:16px; }
+  #summary { padding:10px 18px; font-size:14px; }
+  .pill { display:inline-block; padding:2px 8px; border-radius:10px; margin-right:8px; font-weight:600; }
+  .pill.pass { background:#123d24; color:#6ee79e; }
+  .pill.fail { background:#451b1e; color:#ff8a93; }
+  .pill.skip { background:#3a3320; color:#e6c46e; }
+  table { border-collapse:collapse; width:100%; }
+  th,td { text-align:left; padding:6px 12px; border-bottom:1px solid #1c2330; vertical-align:top; }
+  th { position:sticky; top:0; background:#161c27; color:#9fb0c4; font-weight:600; }
+  td.status { font-weight:700; white-space:nowrap; }
+  td.status.pass { color:#6ee79e; }
+  td.status.fail { color:#ff8a93; }
+  td.status.skip { color:#e6c46e; }
+  tr.cat td { background:#141a24; color:#88a; font-weight:700; letter-spacing:.04em; }
+  .detail { color:#9aa7b6; white-space:pre-wrap; }
+  .ev { color:#cdd7e2; }
+  code { color:#8fd0ff; }
+</style>
+</head>
+<body>
+<header>
+  <h1>light3d — WebGPU feature tests</h1>
+  <div>Capability + correctness probes for <b>character skinning</b>, <b>blendshapes / morph targets</b>, and <b>PBR shading</b>.
+  Mirrors light3d C++ layouts (19-float skinned vertex, 128-bone UBO/SSBO, 16-float packed PBR material).</div>
+</header>
+<div id="summary">Running…</div>
+<table id="results"><thead>
+  <tr><th>Category</th><th>Test</th><th class="status">Status</th><th>ms</th><th>Details</th></tr>
+</thead><tbody id="rows"></tbody></table>
+
+<script type="module">
+// ============================================================================
+//  Tiny test registry
+// ============================================================================
+const TESTS = [];
+function test(category, name, fn, opt = {}) { TESTS.push({ category, name, fn, optional: !!opt.optional }); }
+
+function assert(cond, msg) { if (!cond) throw new Error(msg || 'assertion failed'); }
+function assertClose(a, b, eps, msg) {
+  if (!(Math.abs(a - b) <= eps)) {
+    const e = new Error(`${msg || 'not close'} (|Δ|=${Math.abs(a - b).toExponential(2)}, eps=${eps})`);
+    e.expected = b; e.actual = a; throw e;
+  }
+}
+function assertVecClose(a, b, eps, msg) {
+  for (let i = 0; i < b.length; i++) {
+    if (!(Math.abs(a[i] - b[i]) <= eps)) {
+      const e = new Error(`${msg || 'vec mismatch'} at [${i}] (|Δ|=${Math.abs(a[i] - b[i]).toExponential(2)}, eps=${eps})`);
+      e.expected = Array.from(b).map(round); e.actual = Array.from(a).slice(0, b.length).map(round); throw e;
+    }
+  }
+}
+const round = (x) => (typeof x === 'number' ? +x.toFixed(5) : x);
+const skip = (reason) => ({ skip: true, reason });
+
+// ============================================================================
+//  CPU reference math (column-major mat4, matches WGSL mat4x4f)
+// ============================================================================
+const v3 = {
+  add: (a, b) => [a[0] + b[0], a[1] + b[1], a[2] + b[2]],
+  sub: (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]],
+  dot: (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2],
+  len: (a) => Math.hypot(a[0], a[1], a[2]),
+  norm: (a) => { const l = Math.hypot(a[0], a[1], a[2]) || 1; return [a[0] / l, a[1] / l, a[2] / l]; },
+};
+function mat4Id() { const m = new Float32Array(16); m[0] = m[5] = m[10] = m[15] = 1; return m; }
+function mat4Translate(x, y, z) { const m = mat4Id(); m[12] = x; m[13] = y; m[14] = z; return m; }
+function mat4Scale(x, y, z) { const m = mat4Id(); m[0] = x; m[5] = y; m[10] = z; return m; }
+function mat4RotZ(t) { const m = mat4Id(); const c = Math.cos(t), s = Math.sin(t); m[0] = c; m[1] = s; m[4] = -s; m[5] = c; return m; }
+function mat4Mul(a, b) { // a*b, column-major
+  const o = new Float32Array(16);
+  for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++) {
+    let s = 0; for (let k = 0; k < 4; k++) s += a[k * 4 + r] * b[c * 4 + k]; o[c * 4 + r] = s;
+  }
+  return o;
+}
+function mat4Vec(m, v) { // column-major m * vec4
+  const o = [0, 0, 0, 0];
+  for (let r = 0; r < 4; r++) { let s = 0; for (let k = 0; k < 4; k++) s += m[k * 4 + r] * v[k]; o[r] = s; }
+  return o;
+}
+// Linear blend skinning reference: skinnedPos = Σ wᵢ·(boneᵢ · [pos,1])
+function lbsRef(pos, joints, weights, bones) {
+  const r = [0, 0, 0, 0];
+  for (let k = 0; k < 4; k++) {
+    if (weights[k] === 0) continue;
+    const t = mat4Vec(bones[joints[k]], [pos[0], pos[1], pos[2], 1]);
+    for (let i = 0; i < 4; i++) r[i] += weights[k] * t[i];
+  }
+  return r;
+}
+function srgbToLinear(c) { return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4); }
+// Cook-Torrance GGX specular — IDENTICAL formula to the WGSL below (scalar F0)
+function ggxSpecRef(N, V, L, roughness, F0) {
+  const H = v3.norm(v3.add(V, L));
+  const NoH = Math.max(v3.dot(N, H), 0), NoV = Math.max(v3.dot(N, V), 1e-4),
+        NoL = Math.max(v3.dot(N, L), 1e-4), VoH = Math.max(v3.dot(V, H), 0);
+  const a = roughness * roughness, a2 = a * a;
+  const dn = NoH * NoH * (a2 - 1) + 1;
+  const D = a2 / (Math.PI * dn * dn);
+  const kg = (roughness + 1) * (roughness + 1) / 8;
+  const G = (NoV / (NoV * (1 - kg) + kg)) * (NoL / (NoL * (1 - kg) + kg));
+  const F = F0 + (1 - F0) * Math.pow(1 - VoH, 5);
+  return (D * G * F) / (4 * NoV * NoL);
+}
+
+// ============================================================================
+//  Device bring-up (graceful feature/limit negotiation)
+// ============================================================================
+let DEV = null, ADAPTER = null, FEATURES = new Set();
+const WANT_FEATURES = ['float32-filterable', 'rg11b10ufloat-renderable', 'timestamp-query',
+                       'texture-compression-bc', 'shader-f16'];
+
+async function bringUpDevice() {
+  if (DEV) return DEV;
+  if (!navigator.gpu) { const e = new Error('navigator.gpu missing — WebGPU unavailable'); throw e; }
+  ADAPTER = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+  if (!ADAPTER) throw new Error('requestAdapter returned null');
+  const requiredFeatures = WANT_FEATURES.filter((f) => ADAPTER.features.has(f));
+  // Raise the limits skinning/morph need (storage in vertex stage is the key gotcha).
+  const wishLimits = {
+    maxStorageBuffersInVertexStage: 4,
+    maxStorageBufferBindingSize: 1 << 27,
+    maxUniformBufferBindingSize: 1 << 16,
+    maxBufferSize: 1 << 27,
+  };
+  const requiredLimits = {};
+  for (const k in wishLimits) {
+    if (k in ADAPTER.limits) requiredLimits[k] = Math.min(wishLimits[k], ADAPTER.limits[k]);
+  }
+  DEV = await ADAPTER.requestDevice({ requiredFeatures, requiredLimits });
+  FEATURES = new Set(requiredFeatures);
+  DEV.addEventListener('uncapturederror', (e) => console.error('uncaptured GPU error:', e.error?.message));
+  return DEV;
+}
+
+// ============================================================================
+//  GPU helpers (headless — no canvas)
+// ============================================================================
+function mkBuffer(usage, data) {
+  const b = DEV.createBuffer({ size: data.byteLength, usage });
+  DEV.queue.writeBuffer(b, 0, data);
+  return b;
+}
+async function readStorage(src, byteLength) {
+  const staging = DEV.createBuffer({ size: byteLength, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+  const enc = DEV.createCommandEncoder();
+  enc.copyBufferToBuffer(src, 0, staging, 0, byteLength);
+  DEV.queue.submit([enc.finish()]);
+  await staging.mapAsync(GPUMapMode.READ);
+  const out = new Float32Array(staging.getMappedRange().slice(0));
+  staging.unmap(); staging.destroy();
+  return out;
+}
+// Render 3-vertex covering triangle into a 1×1 rgba32float texel and return [r,g,b,a].
+async function renderTexel(pipeline, bindGroup) {
+  const tex = DEV.createTexture({
+    size: [1, 1], format: 'rgba32float',
+    usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+  });
+  const enc = DEV.createCommandEncoder();
+  const pass = enc.beginRenderPass({
+    colorAttachments: [{ view: tex.createView(), clearValue: { r: 0, g: 0, b: 0, a: 0 }, loadOp: 'clear', storeOp: 'store' }],
+  });
+  pass.setPipeline(pipeline);
+  if (bindGroup) pass.setBindGroup(0, bindGroup);
+  pass.draw(3); pass.end();
+  const buf = DEV.createBuffer({ size: 256, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+  enc.copyTextureToBuffer({ texture: tex }, { buffer: buf, bytesPerRow: 256 }, [1, 1]);
+  DEV.queue.submit([enc.finish()]);
+  await buf.mapAsync(GPUMapMode.READ);
+  const out = Array.from(new Float32Array(buf.getMappedRange().slice(0, 16)));
+  buf.unmap(); buf.destroy(); tex.destroy();
+  return out;
+}
+// Try to create a render pipeline, capturing validation errors (for capability probes).
+async function tryRenderPipeline(desc) {
+  DEV.pushErrorScope('validation');
+  let pipe = null, err = null;
+  try { pipe = DEV.createRenderPipeline(desc); } catch (e) { err = e; }
+  const scoped = await DEV.popErrorScope();
+  if (scoped && !err) err = scoped;
+  return { pipe, err };
+}
+function solidTex(rgba, format = 'rgba8unorm') {
+  const t = DEV.createTexture({ size: [1, 1], format, usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+  DEV.queue.writeTexture({ texture: t }, new Uint8Array(rgba), { bytesPerRow: 4 }, [1, 1]);
+  return t;
+}
+const COVER_VS = /* wgsl */`
+@vertex fn cover(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
+  var p = array<vec2f,3>(vec2f(-1,-1), vec2f(3,-1), vec2f(-1,3));
+  return vec4f(p[i], 0.0, 1.0);
+}`;
+
+// ============================================================================
+//  A. Capability gate
+// ============================================================================
+test('A. Capability', 'WebGPU device + record features', async () => {
+  await bringUpDevice();
+  const present = WANT_FEATURES.filter((f) => ADAPTER.features.has(f));
+  return { detail: `enabled features: ${present.length ? present.join(', ') : '(none optional)'}` };
+});
+
+test('A. Capability', 'Limits sufficient for skinning + PBR', async () => {
+  await bringUpDevice();
+  const L = DEV.limits;
+  const checks = [
+    ['maxVertexAttributes', L.maxVertexAttributes, 6],          // pos,color,normal,uv,jointIdx,jointWeight
+    ['maxVertexBuffers', L.maxVertexBuffers, 6],
+    ['maxUniformBufferBindingSize', L.maxUniformBufferBindingSize, 8192], // 128 mat4 UBO bones
+    ['maxStorageBufferBindingSize', L.maxStorageBufferBindingSize, 1 << 20],
+    ['maxSampledTexturesPerShaderStage', L.maxSampledTexturesPerShaderStage, 5], // PBR + IBL
+    ['maxSamplersPerShaderStage', L.maxSamplersPerShaderStage, 2],
+  ];
+  const fails = checks.filter(([, v, need]) => !(v >= need));
+  if (fails.length) {
+    const e = new Error('limit(s) below requirement: ' + fails.map(([n, v, need]) => `${n}=${v}<${need}`).join(', '));
+    e.expected = checks.map(([n, , need]) => `${n}≥${need}`); e.actual = checks.map(([n, v]) => `${n}=${v}`);
+    throw e;
+  }
+  return { detail: checks.map(([n, v]) => `${n}=${v}`).join('  ') };
+});
+
+test('A. Capability', 'Storage buffers usable in VERTEX stage (SSBO skinning/morph)', async () => {
+  await bringUpDevice();
+  const vsl = DEV.limits.maxStorageBuffersInVertexStage;
+  // maxStorageBuffersInVertexStage may be undefined on impls without split limits → fall back.
+  const allowed = (vsl === undefined) ? DEV.limits.maxStorageBuffersPerShaderStage : vsl;
+  const mod = DEV.createShaderModule({ code: /* wgsl */`
+    @group(0) @binding(0) var<storage,read> data: array<vec4f>;
+    @vertex fn vs(@builtin(vertex_index) i:u32) -> @builtin(position) vec4f { return data[i]; }
+    @fragment fn fs() -> @location(0) vec4f { return vec4f(1.0); }` });
+  const { pipe, err } = await tryRenderPipeline({
+    layout: 'auto', vertex: { module: mod, entryPoint: 'vs' },
+    fragment: { module: mod, entryPoint: 'fs', targets: [{ format: 'rgba8unorm' }] },
+    primitive: { topology: 'triangle-list' },
+  });
+  if (err || !pipe) return skip(`vertex-stage storage buffers unsupported here (limit=${allowed}). UBO/compute skinning paths apply instead. [${err?.message || 'pipeline null'}]`);
+  return { detail: `maxStorageBuffersInVertexStage=${allowed}` };
+}, { optional: true });
+
+// ============================================================================
+//  E. Infrastructure sanity (run early so failures localize)
+// ============================================================================
+test('E. Infra', 'Compute storage-buffer readback round-trip', async () => {
+  await bringUpDevice();
+  const out = mkBuffer(GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC, new Float32Array(4));
+  const mod = DEV.createShaderModule({ code: /* wgsl */`
+    @group(0) @binding(0) var<storage,read_write> o: array<f32>;
+    @compute @workgroup_size(4) fn main(@builtin(global_invocation_id) g: vec3u) {
+      o[g.x] = f32(g.x) * 2.0 + 1.0;
+    }` });
+  const pipe = DEV.createComputePipeline({ layout: 'auto', compute: { module: mod, entryPoint: 'main' } });
+  const bg = DEV.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: out } }] });
+  const enc = DEV.createCommandEncoder();
+  const p = enc.beginComputePass(); p.setPipeline(pipe); p.setBindGroup(0, bg); p.dispatchWorkgroups(1); p.end();
+  DEV.queue.submit([enc.finish()]);
+  const r = await readStorage(out, 16);
+  assertVecClose(r, [1, 3, 5, 7], 1e-6, 'compute output');
+});
+
+test('E. Infra', 'Render-to-texture + copyTextureToBuffer (256-byte align)', async () => {
+  await bringUpDevice();
+  const mod = DEV.createShaderModule({ code: COVER_VS + /* wgsl */`
+    @fragment fn fs() -> @location(0) vec4f { return vec4f(0.25, 0.5, 0.75, 1.0); }` });
+  const pipe = DEV.createRenderPipeline({
+    layout: 'auto', vertex: { module: mod, entryPoint: 'cover' },
+    fragment: { module: mod, entryPoint: 'fs', targets: [{ format: 'rgba32float' }] },
+    primitive: { topology: 'triangle-list' },
+  });
+  const texel = await renderTexel(pipe, null);
+  assertVecClose(texel, [0.25, 0.5, 0.75, 1.0], 1e-6, 'rendered texel');
+});
+
+// ============================================================================
+//  B. Skinning  (mirror light3d skinning.h: 4 influences, 128-bone cap)
+// ============================================================================
+// Shared test fixture: one vertex influenced by 2 bones (translate + rotate+scale).
+function skinFixture() {
+  const pos = [1, 0, 0];
+  const joints = [3, 7, 0, 0];
+  const weights = [0.6, 0.4, 0, 0];
+  const bones = [];
+  for (let i = 0; i < 128; i++) bones.push(mat4Id());
+  bones[3] = mat4Translate(0, 2, 0);
+  bones[7] = mat4Mul(mat4RotZ(Math.PI / 2), mat4Scale(2, 2, 2)); // rotate 90° then scale
+  const expected = lbsRef(pos, joints, weights, bones);
+  return { pos, joints, weights, bones, expected };
+}
+function packBones(bones) { const f = new Float32Array(128 * 16); for (let i = 0; i < 128; i++) f.set(bones[i], i * 16); return f; }
+
+test('B. Skinning', 'UBO linear-blend skinning in vertex stage (128 mat4)', async () => {
+  await bringUpDevice();
+  const fx = skinFixture();
+  // Vertex packed as 3×vec4: pos(.w=1), joints(as float), weights — matches skinning.h jointIdx4+weight4
+  const vert = new Float32Array([fx.pos[0], fx.pos[1], fx.pos[2], 1, fx.joints[0], fx.joints[1], fx.joints[2], fx.joints[3], fx.weights[0], fx.weights[1], fx.weights[2], fx.weights[3], 0, 0, 0, 0]);
+  const vertBuf = mkBuffer(GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST, vert);
+  const boneBuf = mkBuffer(GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST, packBones(fx.bones)); // 8192 bytes
+  const mod = DEV.createShaderModule({ code: /* wgsl */`
+    struct V { pos: vec4f, joints: vec4f, weights: vec4f, _pad: vec4f };
+    @group(0) @binding(0) var<uniform> v: V;
+    @group(0) @binding(1) var<uniform> bones: array<mat4x4f, 128>;
+    struct Out { @builtin(position) p: vec4f, @location(0) @interpolate(flat) skinned: vec4f };
+    @vertex fn vs(@builtin(vertex_index) i: u32) -> Out {
+      var corners = array<vec2f,3>(vec2f(-1,-1), vec2f(3,-1), vec2f(-1,3));
+      var s = vec4f(0.0);
+      for (var k = 0u; k < 4u; k++) { s += v.weights[k] * (bones[u32(v.joints[k])] * vec4f(v.pos.xyz, 1.0)); }
+      var o: Out; o.p = vec4f(corners[i], 0.0, 1.0); o.skinned = s; return o;
+    }
+    @fragment fn fs(o: Out) -> @location(0) vec4f { return o.skinned; }` });
+  const pipe = DEV.createRenderPipeline({
+    layout: 'auto', vertex: { module: mod, entryPoint: 'vs' },
+    fragment: { module: mod, entryPoint: 'fs', targets: [{ format: 'rgba32float' }] },
+    primitive: { topology: 'triangle-list' },
+  });
+  const bg = DEV.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries: [
+    { binding: 0, resource: { buffer: vertBuf } }, { binding: 1, resource: { buffer: boneBuf } }] });
+  const texel = await renderTexel(pipe, bg);
+  assertVecClose(texel, fx.expected, 1e-4, 'skinned position (UBO)');
+  return { detail: `pos→${fx.expected.slice(0, 3).map(round).join(', ')}` };
+});
+
+test('B. Skinning', 'SSBO linear-blend skinning in vertex stage', async () => {
+  await bringUpDevice();
+  const fx = skinFixture();
+  const vert = new Float32Array([fx.pos[0], fx.pos[1], fx.pos[2], 1, fx.joints[0], fx.joints[1], fx.joints[2], fx.joints[3], fx.weights[0], fx.weights[1], fx.weights[2], fx.weights[3], 0, 0, 0, 0]);
+  const vertBuf = mkBuffer(GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST, vert);
+  const boneBuf = mkBuffer(GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST, packBones(fx.bones));
+  const mod = DEV.createShaderModule({ code: /* wgsl */`
+    struct V { pos: vec4f, joints: vec4f, weights: vec4f, _pad: vec4f };
+    @group(0) @binding(0) var<uniform> v: V;
+    @group(0) @binding(1) var<storage,read> bones: array<mat4x4f>;
+    struct Out { @builtin(position) p: vec4f, @location(0) @interpolate(flat) skinned: vec4f };
+    @vertex fn vs(@builtin(vertex_index) i: u32) -> Out {
+      var corners = array<vec2f,3>(vec2f(-1,-1), vec2f(3,-1), vec2f(-1,3));
+      var s = vec4f(0.0);
+      for (var k = 0u; k < 4u; k++) { s += v.weights[k] * (bones[u32(v.joints[k])] * vec4f(v.pos.xyz, 1.0)); }
+      var o: Out; o.p = vec4f(corners[i], 0.0, 1.0); o.skinned = s; return o;
+    }
+    @fragment fn fs(o: Out) -> @location(0) vec4f { return o.skinned; }` });
+  const { pipe, err } = await tryRenderPipeline({
+    layout: 'auto', vertex: { module: mod, entryPoint: 'vs' },
+    fragment: { module: mod, entryPoint: 'fs', targets: [{ format: 'rgba32float' }] },
+    primitive: { topology: 'triangle-list' },
+  });
+  if (err || !pipe) return skip(`vertex-stage storage unsupported — use UBO/compute skinning. [${err?.message || 'pipeline null'}]`);
+  const bg = DEV.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries: [
+    { binding: 0, resource: { buffer: vertBuf } }, { binding: 1, resource: { buffer: boneBuf } }] });
+  const texel = await renderTexel(pipe, bg);
+  assertVecClose(texel, fx.expected, 1e-4, 'skinned position (SSBO)');
+}, { optional: true });
+
+test('B. Skinning', 'Compute LBS over 256 verts (SSBO in/out)', async () => {
+  await bringUpDevice();
+  const N = 256;
+  const fx = skinFixture();
+  const posArr = new Float32Array(N * 4), jntArr = new Float32Array(N * 4), wgtArr = new Float32Array(N * 4);
+  const expected = [];
+  for (let i = 0; i < N; i++) {
+    const p = [Math.sin(i) * 1.5, Math.cos(i * 0.5), (i % 7) - 3];
+    posArr.set([p[0], p[1], p[2], 1], i * 4);
+    jntArr.set([fx.joints[0], fx.joints[1], 0, 0], i * 4);
+    wgtArr.set([fx.weights[0], fx.weights[1], 0, 0], i * 4);
+    expected.push(lbsRef(p, [fx.joints[0], fx.joints[1], 0, 0], [fx.weights[0], fx.weights[1], 0, 0], fx.bones));
+  }
+  const posBuf = mkBuffer(GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST, posArr);
+  const jntBuf = mkBuffer(GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST, jntArr);
+  const wgtBuf = mkBuffer(GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST, wgtArr);
+  const bonBuf = mkBuffer(GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST, packBones(fx.bones));
+  const outBuf = mkBuffer(GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC, new Float32Array(N * 4));
+  const mod = DEV.createShaderModule({ code: /* wgsl */`
+    @group(0) @binding(0) var<storage,read> pos: array<vec4f>;
+    @group(0) @binding(1) var<storage,read> jnt: array<vec4f>;
+    @group(0) @binding(2) var<storage,read> wgt: array<vec4f>;
+    @group(0) @binding(3) var<storage,read> bones: array<mat4x4f>;
+    @group(0) @binding(4) var<storage,read_write> outp: array<vec4f>;
+    @compute @workgroup_size(64) fn main(@builtin(global_invocation_id) g: vec3u) {
+      let i = g.x; if (i >= ${N}u) { return; }
+      var s = vec4f(0.0);
+      for (var k = 0u; k < 4u; k++) { s += wgt[i][k] * (bones[u32(jnt[i][k])] * vec4f(pos[i].xyz, 1.0)); }
+      outp[i] = s;
+    }` });
+  const pipe = DEV.createComputePipeline({ layout: 'auto', compute: { module: mod, entryPoint: 'main' } });
+  const bg = DEV.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries: [
+    { binding: 0, resource: { buffer: posBuf } }, { binding: 1, resource: { buffer: jntBuf } },
+    { binding: 2, resource: { buffer: wgtBuf } }, { binding: 3, resource: { buffer: bonBuf } },
+    { binding: 4, resource: { buffer: outBuf } }] });
+  const enc = DEV.createCommandEncoder();
+  const p = enc.beginComputePass(); p.setPipeline(pipe); p.setBindGroup(0, bg); p.dispatchWorkgroups(Math.ceil(N / 64)); p.end();
+  DEV.queue.submit([enc.finish()]);
+  const r = await readStorage(outBuf, N * 16);
+  for (let i = 0; i < N; i++) assertVecClose(r.slice(i * 4, i * 4 + 3), expected[i].slice(0, 3), 1e-4, `vert ${i}`);
+  return { detail: `${N} verts skinned on GPU, all match CPU LBS` };
+});
+
+test('B. Skinning', '128-bone stress — high joint index via SSBO compute', async () => {
+  await bringUpDevice();
+  const bones = []; for (let i = 0; i < 128; i++) bones.push(mat4Translate(i, 0, 0));
+  const pos = [0, 1, 0], joints = [127, 64, 0, 0], weights = [0.5, 0.5, 0, 0];
+  const expected = lbsRef(pos, joints, weights, bones);
+  const meta = mkBuffer(GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    new Float32Array([pos[0], pos[1], pos[2], 1, joints[0], joints[1], joints[2], joints[3], weights[0], weights[1], weights[2], weights[3], 0, 0, 0, 0]));
+  const bonBuf = mkBuffer(GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST, packBones(bones));
+  const outBuf = mkBuffer(GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC, new Float32Array(4));
+  const mod = DEV.createShaderModule({ code: /* wgsl */`
+    struct V { pos: vec4f, joints: vec4f, weights: vec4f, _pad: vec4f };
+    @group(0) @binding(0) var<storage,read> v: V;
+    @group(0) @binding(1) var<storage,read> bones: array<mat4x4f>;
+    @group(0) @binding(2) var<storage,read_write> outp: array<vec4f>;
+    @compute @workgroup_size(1) fn main() {
+      var s = vec4f(0.0);
+      for (var k = 0u; k < 4u; k++) { s += v.weights[k] * (bones[u32(v.joints[k])] * vec4f(v.pos.xyz, 1.0)); }
+      outp[0] = s;
+    }` });
+  const pipe = DEV.createComputePipeline({ layout: 'auto', compute: { module: mod, entryPoint: 'main' } });
+  const bg = DEV.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries: [
+    { binding: 0, resource: { buffer: meta } }, { binding: 1, resource: { buffer: bonBuf } }, { binding: 2, resource: { buffer: outBuf } }] });
+  const enc = DEV.createCommandEncoder();
+  const p = enc.beginComputePass(); p.setPipeline(pipe); p.setBindGroup(0, bg); p.dispatchWorkgroups(1); p.end();
+  DEV.queue.submit([enc.finish()]);
+  const r = await readStorage(outBuf, 16);
+  assertVecClose(r.slice(0, 3), expected.slice(0, 3), 1e-4, 'bone[127]/bone[64] influence');
+  return { detail: `joints [127,64] → ${expected.slice(0, 3).map(round).join(', ')}` };
+});
+
+// ============================================================================
+//  C. Blendshapes / morph targets (forward-looking — not yet in C++)
+// ============================================================================
+test('C. Blendshapes', 'Vertex-stage morph: base + Σ wᵢ·Δᵢ (storage deltas)', async () => {
+  await bringUpDevice();
+  const base = [1, 1, 1];
+  const deltas = [[0.5, 0, 0], [0, 0.25, 0], [0, 0, -0.1]];
+  const wts = [1.0, 0.5, 2.0];
+  const expected = base.slice();
+  for (let t = 0; t < 3; t++) for (let c = 0; c < 3; c++) expected[c] += wts[t] * deltas[t][c];
+  const deltaArr = new Float32Array(3 * 4); for (let t = 0; t < 3; t++) deltaArr.set([...deltas[t], 0], t * 4);
+  const meta = mkBuffer(GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    new Float32Array([base[0], base[1], base[2], 0, wts[0], wts[1], wts[2], 0]));
+  const dBuf = mkBuffer(GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST, deltaArr);
+  const mod = DEV.createShaderModule({ code: /* wgsl */`
+    struct M { base: vec4f, weights: vec4f };
+    @group(0) @binding(0) var<uniform> m: M;
+    @group(0) @binding(1) var<storage,read> deltas: array<vec4f>;
+    struct Out { @builtin(position) p: vec4f, @location(0) @interpolate(flat) morphed: vec4f };
+    @vertex fn vs(@builtin(vertex_index) i: u32) -> Out {
+      var corners = array<vec2f,3>(vec2f(-1,-1), vec2f(3,-1), vec2f(-1,3));
+      var pos = m.base.xyz;
+      for (var t = 0u; t < 3u; t++) { pos += m.weights[t] * deltas[t].xyz; }
+      var o: Out; o.p = vec4f(corners[i], 0.0, 1.0); o.morphed = vec4f(pos, 1.0); return o;
+    }
+    @fragment fn fs(o: Out) -> @location(0) vec4f { return o.morphed; }` });
+  const { pipe, err } = await tryRenderPipeline({
+    layout: 'auto', vertex: { module: mod, entryPoint: 'vs' },
+    fragment: { module: mod, entryPoint: 'fs', targets: [{ format: 'rgba32float' }] },
+    primitive: { topology: 'triangle-list' },
+  });
+  if (err || !pipe) return skip(`vertex-stage storage unsupported — accumulate morphs in a compute pre-pass. [${err?.message || 'pipeline null'}]`);
+  const bg = DEV.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries: [
+    { binding: 0, resource: { buffer: meta } }, { binding: 1, resource: { buffer: dBuf } }] });
+  const texel = await renderTexel(pipe, bg);
+  assertVecClose(texel.slice(0, 3), expected, 1e-5, 'morphed position');
+  return { detail: `→ ${expected.map(round).join(', ')}` };
+}, { optional: true });
+
+test('C. Blendshapes', 'Compute morph accumulation — 50 targets', async () => {
+  await bringUpDevice();
+  const T = 50, V = 32;
+  const base = new Float32Array(V * 4), deltas = new Float32Array(V * T * 4), wts = new Float32Array(T * 4 / 4);
+  const wtsArr = new Float32Array(T);
+  for (let t = 0; t < T; t++) wtsArr[t] = (t % 2 === 0) ? 0.1 : 0.0; // half active
+  const expected = [];
+  for (let v = 0; v < V; v++) {
+    const b = [v * 0.01, -v * 0.02, v % 3];
+    base.set([b[0], b[1], b[2], 1], v * 4);
+    const acc = b.slice();
+    for (let t = 0; t < T; t++) {
+      const d = [Math.sin(v + t) * 0.3, Math.cos(v - t) * 0.2, (t - 25) * 0.01];
+      deltas.set([d[0], d[1], d[2], 0], (v * T + t) * 4);
+      for (let c = 0; c < 3; c++) acc[c] += wtsArr[t] * d[c];
+    }
+    expected.push(acc);
+  }
+  const baseBuf = mkBuffer(GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST, base);
+  const dBuf = mkBuffer(GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST, deltas);
+  const wBuf = mkBuffer(GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST, wtsArr);
+  const outBuf = mkBuffer(GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC, new Float32Array(V * 4));
+  const mod = DEV.createShaderModule({ code: /* wgsl */`
+    @group(0) @binding(0) var<storage,read> base: array<vec4f>;
+    @group(0) @binding(1) var<storage,read> deltas: array<vec4f>;
+    @group(0) @binding(2) var<storage,read> wts: array<f32>;
+    @group(0) @binding(3) var<storage,read_write> outp: array<vec4f>;
+    @compute @workgroup_size(32) fn main(@builtin(global_invocation_id) g: vec3u) {
+      let v = g.x; if (v >= ${V}u) { return; }
+      var pos = base[v].xyz;
+      for (var t = 0u; t < ${T}u; t++) { pos += wts[t] * deltas[v * ${T}u + t].xyz; }
+      outp[v] = vec4f(pos, 1.0);
+    }` });
+  const pipe = DEV.createComputePipeline({ layout: 'auto', compute: { module: mod, entryPoint: 'main' } });
+  const bg = DEV.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries: [
+    { binding: 0, resource: { buffer: baseBuf } }, { binding: 1, resource: { buffer: dBuf } },
+    { binding: 2, resource: { buffer: wBuf } }, { binding: 3, resource: { buffer: outBuf } }] });
+  const enc = DEV.createCommandEncoder();
+  const p = enc.beginComputePass(); p.setPipeline(pipe); p.setBindGroup(0, bg); p.dispatchWorkgroups(1); p.end();
+  DEV.queue.submit([enc.finish()]);
+  const r = await readStorage(outBuf, V * 16);
+  for (let v = 0; v < V; v++) assertVecClose(r.slice(v * 4, v * 4 + 3), expected[v].slice(0, 3), 1e-4, `vert ${v}`);
+  return { detail: `${V} verts × ${T} targets accumulated on GPU` };
+});
+
+test('C. Blendshapes', 'Morph-as-vertex-buffers ceiling (maxVertexBuffers)', async () => {
+  await bringUpDevice();
+  const maxVB = DEV.limits.maxVertexBuffers;
+  // base + N target position streams as separate vertex buffers.
+  const targets = Math.min(maxVB - 1, 7);
+  assert(targets >= 1, 'need at least 1 morph stream');
+  return { detail: `maxVertexBuffers=${maxVB} → up to ${targets} morph streams as vertex attributes (storage-buffer path scales further)` };
+});
+
+// ============================================================================
+//  D. PBR shading
+// ============================================================================
+test('D. PBR', 'Multi-texture material sampling (baseColor/MR/normal/emissive + IBL)', async () => {
+  await bringUpDevice();
+  const t0 = solidTex([200, 0, 0, 255]);   // baseColor.r
+  const t1 = solidTex([0, 150, 0, 255]);   // metallicRoughness.g
+  const t2 = solidTex([0, 0, 180, 255]);   // normal.b
+  const t3 = solidTex([0, 0, 0, 255]);     // emissive
+  const t4 = solidTex([90, 0, 0, 255]);    // IBL.r
+  const samp = DEV.createSampler({});
+  const mod = DEV.createShaderModule({ code: COVER_VS + /* wgsl */`
+    @group(0) @binding(0) var s: sampler;
+    @group(0) @binding(1) var baseColor: texture_2d<f32>;
+    @group(0) @binding(2) var mr: texture_2d<f32>;
+    @group(0) @binding(3) var nrm: texture_2d<f32>;
+    @group(0) @binding(4) var emis: texture_2d<f32>;
+    @group(0) @binding(5) var ibl: texture_2d<f32>;
+    @fragment fn fs() -> @location(0) vec4f {
+      let uv = vec2f(0.5, 0.5);
+      let bc = textureSample(baseColor, s, uv);
+      let m  = textureSample(mr, s, uv);
+      let n  = textureSample(nrm, s, uv);
+      let e  = textureSample(emis, s, uv);
+      let l  = textureSample(ibl, s, uv);
+      return vec4f(bc.r, m.g, n.b, l.r);
+    }` });
+  const pipe = DEV.createRenderPipeline({
+    layout: 'auto', vertex: { module: mod, entryPoint: 'cover' },
+    fragment: { module: mod, entryPoint: 'fs', targets: [{ format: 'rgba32float' }] },
+    primitive: { topology: 'triangle-list' },
+  });
+  const bg = DEV.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries: [
+    { binding: 0, resource: samp }, { binding: 1, resource: t0.createView() }, { binding: 2, resource: t1.createView() },
+    { binding: 3, resource: t2.createView() }, { binding: 4, resource: t3.createView() }, { binding: 5, resource: t4.createView() }] });
+  const texel = await renderTexel(pipe, bg);
+  assertVecClose(texel, [200 / 255, 150 / 255, 180 / 255, 90 / 255], 0.01, 'sampled material channels');
+  return { detail: '5 textures + sampler bound & sampled in one bind group' };
+});
+
+test('D. PBR', 'sRGB texture linearization on sample', async () => {
+  await bringUpDevice();
+  const v = 188;
+  const tex = solidTex([v, v, v, 255], 'rgba8unorm-srgb');
+  const samp = DEV.createSampler({});
+  const mod = DEV.createShaderModule({ code: COVER_VS + /* wgsl */`
+    @group(0) @binding(0) var s: sampler;
+    @group(0) @binding(1) var t: texture_2d<f32>;
+    @fragment fn fs() -> @location(0) vec4f { return textureSample(t, s, vec2f(0.5)); }` });
+  const pipe = DEV.createRenderPipeline({
+    layout: 'auto', vertex: { module: mod, entryPoint: 'cover' },
+    fragment: { module: mod, entryPoint: 'fs', targets: [{ format: 'rgba32float' }] },
+    primitive: { topology: 'triangle-list' },
+  });
+  const bg = DEV.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries: [{ binding: 0, resource: samp }, { binding: 1, resource: tex.createView() }] });
+  const texel = await renderTexel(pipe, bg);
+  const expected = srgbToLinear(v / 255);
+  assertClose(texel[0], expected, 0.01, 'sRGB→linear');
+  return { detail: `srgb ${v}/255 → linear ${round(expected)} (got ${round(texel[0])})` };
+});
+
+test('D. PBR', 'Mipmap selection + trilinear filtering', async () => {
+  await bringUpDevice();
+  const tex = DEV.createTexture({ size: [2, 2], format: 'rgba8unorm', mipLevelCount: 2,
+    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+  const mip0 = new Uint8Array([255,0,0,255, 255,0,0,255, 255,0,0,255, 255,0,0,255]); // red, bytesPerRow 8
+  DEV.queue.writeTexture({ texture: tex, mipLevel: 0 }, mip0, { bytesPerRow: 8 }, [2, 2]);
+  DEV.queue.writeTexture({ texture: tex, mipLevel: 1 }, new Uint8Array([0, 0, 255, 255]), { bytesPerRow: 4 }, [1, 1]); // blue
+  const samp = DEV.createSampler({ magFilter: 'linear', minFilter: 'linear', mipmapFilter: 'linear' });
+  const mod = DEV.createShaderModule({ code: COVER_VS + /* wgsl */`
+    @group(0) @binding(0) var s: sampler;
+    @group(0) @binding(1) var t: texture_2d<f32>;
+    @fragment fn fs() -> @location(0) vec4f { return textureSampleLevel(t, s, vec2f(0.5), 1.0); }` });
+  const pipe = DEV.createRenderPipeline({
+    layout: 'auto', vertex: { module: mod, entryPoint: 'cover' },
+    fragment: { module: mod, entryPoint: 'fs', targets: [{ format: 'rgba32float' }] },
+    primitive: { topology: 'triangle-list' },
+  });
+  const bg = DEV.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries: [{ binding: 0, resource: samp }, { binding: 1, resource: tex.createView() }] });
+  const texel = await renderTexel(pipe, bg);
+  assertVecClose(texel, [0, 0, 1, 1], 0.02, 'LOD 1 = blue mip');
+  return { detail: 'explicit LOD 1 selects 1×1 blue mip (trilinear sampler)' };
+});
+
+test('D. PBR', 'Cubemap sampling for IBL', async () => {
+  await bringUpDevice();
+  const faces = [[255,0,0,255],[0,255,0,255],[0,0,255,255],[255,255,0,255],[255,0,255,255],[0,255,255,255]]; // +X,-X,+Y,-Y,+Z,-Z
+  const tex = DEV.createTexture({ size: [1, 1, 6], format: 'rgba8unorm', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+  for (let f = 0; f < 6; f++) DEV.queue.writeTexture({ texture: tex, origin: { x: 0, y: 0, z: f } }, new Uint8Array(faces[f]), { bytesPerRow: 4 }, [1, 1, 1]);
+  const samp = DEV.createSampler({});
+  const mod = DEV.createShaderModule({ code: COVER_VS + /* wgsl */`
+    @group(0) @binding(0) var s: sampler;
+    @group(0) @binding(1) var t: texture_cube<f32>;
+    @fragment fn fs() -> @location(0) vec4f { return textureSampleLevel(t, s, vec3f(1.0, 0.0, 0.0), 0.0); }` });
+  const pipe = DEV.createRenderPipeline({
+    layout: 'auto', vertex: { module: mod, entryPoint: 'cover' },
+    fragment: { module: mod, entryPoint: 'fs', targets: [{ format: 'rgba32float' }] },
+    primitive: { topology: 'triangle-list' },
+  });
+  const bg = DEV.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries: [{ binding: 0, resource: samp }, { binding: 1, resource: tex.createView({ dimension: 'cube' }) }] });
+  const texel = await renderTexel(pipe, bg);
+  assertVecClose(texel, [1, 0, 0, 1], 0.02, '+X direction → +X face (red)');
+  return { detail: 'direction (1,0,0) selects +X cube face' };
+});
+
+test('D. PBR', 'GGX Cook-Torrance BRDF matches CPU reference', async () => {
+  await bringUpDevice();
+  const cases = [
+    { N: [0, 0, 1], V: v3.norm([0, 0.4, 1]), L: v3.norm([0.3, 0.2, 1]), r: 0.25 },
+    { N: [0, 0, 1], V: v3.norm([0.5, 0.5, 1]), L: v3.norm([-0.4, 0.1, 1]), r: 0.6 },
+    { N: [0, 0, 1], V: v3.norm([0, 0, 1]), L: v3.norm([0.1, 0.1, 1]), r: 0.05 },
+  ];
+  const F0 = 0.04;
+  const inArr = new Float32Array(cases.length * 12);
+  cases.forEach((c, i) => inArr.set([...c.N, c.r, ...c.V, F0, ...c.L, 0], i * 12));
+  const inBuf = mkBuffer(GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST, inArr);
+  const outBuf = mkBuffer(GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC, new Float32Array(cases.length));
+  const mod = DEV.createShaderModule({ code: /* wgsl */`
+    struct In { N: vec4f, V: vec4f, L: vec4f };  // N.w=roughness, V.w=F0
+    @group(0) @binding(0) var<storage,read> data: array<In>;
+    @group(0) @binding(1) var<storage,read_write> outp: array<f32>;
+    const PI = 3.14159265359;
+    @compute @workgroup_size(8) fn main(@builtin(global_invocation_id) g: vec3u) {
+      let i = g.x; if (i >= ${cases.length}u) { return; }
+      let N = data[i].N.xyz; let V = data[i].V.xyz; let L = data[i].L.xyz;
+      let roughness = data[i].N.w; let F0 = data[i].V.w;
+      let H = normalize(V + L);
+      let NoH = max(dot(N, H), 0.0); let NoV = max(dot(N, V), 1e-4);
+      let NoL = max(dot(N, L), 1e-4); let VoH = max(dot(V, H), 0.0);
+      let a = roughness * roughness; let a2 = a * a;
+      let dn = NoH * NoH * (a2 - 1.0) + 1.0;
+      let D = a2 / (PI * dn * dn);
+      let kg = (roughness + 1.0) * (roughness + 1.0) / 8.0;
+      let G = (NoV / (NoV * (1.0 - kg) + kg)) * (NoL / (NoL * (1.0 - kg) + kg));
+      let F = F0 + (1.0 - F0) * pow(1.0 - VoH, 5.0);
+      outp[i] = (D * G * F) / (4.0 * NoV * NoL);
+    }` });
+  const pipe = DEV.createComputePipeline({ layout: 'auto', compute: { module: mod, entryPoint: 'main' } });
+  const bg = DEV.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: inBuf } }, { binding: 1, resource: { buffer: outBuf } }] });
+  const enc = DEV.createCommandEncoder();
+  const p = enc.beginComputePass(); p.setPipeline(pipe); p.setBindGroup(0, bg); p.dispatchWorkgroups(1); p.end();
+  DEV.queue.submit([enc.finish()]);
+  const r = await readStorage(outBuf, cases.length * 4);
+  cases.forEach((c, i) => {
+    const ref = ggxSpecRef(c.N, c.V, c.L, c.r, F0);
+    assertClose(r[i], ref, Math.max(1e-4, ref * 1e-3), `case ${i} (roughness=${c.r})`);
+  });
+  return { detail: cases.map((c, i) => `r=${c.r}:${round(r[i])}`).join('  ') };
+});
+
+test('D. PBR', 'HDR rgba16float render target + Reinhard tonemap', async () => {
+  await bringUpDevice();
+  // Pass 1: write 4.0 (>1) into rgba16float — proves HDR storage survives.
+  const hdr = DEV.createTexture({ size: [1, 1], format: 'rgba16float',
+    usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING });
+  const mod1 = DEV.createShaderModule({ code: COVER_VS + `@fragment fn fs()->@location(0) vec4f { return vec4f(4.0,0.0,0.0,1.0); }` });
+  const pipe1 = DEV.createRenderPipeline({ layout: 'auto', vertex: { module: mod1, entryPoint: 'cover' },
+    fragment: { module: mod1, entryPoint: 'fs', targets: [{ format: 'rgba16float' }] }, primitive: { topology: 'triangle-list' } });
+  // Pass 2: sample HDR, tonemap r/(1+r)=0.8, write to rgba32float for exact readback.
+  const samp = DEV.createSampler({});
+  const mod2 = DEV.createShaderModule({ code: COVER_VS + /* wgsl */`
+    @group(0) @binding(0) var s: sampler;
+    @group(0) @binding(1) var hdr: texture_2d<f32>;
+    @fragment fn fs() -> @location(0) vec4f {
+      let c = textureSample(hdr, s, vec2f(0.5)).rgb;
+      let mapped = c / (vec3f(1.0) + c);
+      return vec4f(mapped, 1.0);
+    }` });
+  const pipe2 = DEV.createRenderPipeline({ layout: 'auto', vertex: { module: mod2, entryPoint: 'cover' },
+    fragment: { module: mod2, entryPoint: 'fs', targets: [{ format: 'rgba32float' }] }, primitive: { topology: 'triangle-list' } });
+  const bg2 = DEV.createBindGroup({ layout: pipe2.getBindGroupLayout(0), entries: [{ binding: 0, resource: samp }, { binding: 1, resource: hdr.createView() }] });
+
+  const out = DEV.createTexture({ size: [1, 1], format: 'rgba32float', usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
+  const enc = DEV.createCommandEncoder();
+  let pass = enc.beginRenderPass({ colorAttachments: [{ view: hdr.createView(), clearValue: { r: 0, g: 0, b: 0, a: 0 }, loadOp: 'clear', storeOp: 'store' }] });
+  pass.setPipeline(pipe1); pass.draw(3); pass.end();
+  pass = enc.beginRenderPass({ colorAttachments: [{ view: out.createView(), clearValue: { r: 0, g: 0, b: 0, a: 0 }, loadOp: 'clear', storeOp: 'store' }] });
+  pass.setPipeline(pipe2); pass.setBindGroup(0, bg2); pass.draw(3); pass.end();
+  const buf = DEV.createBuffer({ size: 256, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+  enc.copyTextureToBuffer({ texture: out }, { buffer: buf, bytesPerRow: 256 }, [1, 1]);
+  DEV.queue.submit([enc.finish()]);
+  await buf.mapAsync(GPUMapMode.READ);
+  const texel = Array.from(new Float32Array(buf.getMappedRange().slice(0, 16)));
+  buf.unmap(); buf.destroy();
+  assertClose(texel[0], 4 / 5, 0.01, 'tonemapped HDR 4.0');
+  return { detail: `HDR 4.0 stored in rgba16float → tonemap ${round(texel[0])} (≈0.8)` };
+});
+
+test('D. PBR', 'rgba32float linear filtering (float32-filterable)', async () => {
+  await bringUpDevice();
+  if (!FEATURES.has('float32-filterable')) return skip('float32-filterable feature not available — use rgba16float for filtered HDR IBL');
+  const tex = DEV.createTexture({ size: [2, 1], format: 'rgba32float', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+  DEV.queue.writeTexture({ texture: tex }, new Float32Array([0, 0, 0, 1, 4, 0, 0, 1]), { bytesPerRow: 32 }, [2, 1]);
+  const samp = DEV.createSampler({ magFilter: 'linear', minFilter: 'linear' });
+  const mod = DEV.createShaderModule({ code: COVER_VS + /* wgsl */`
+    @group(0) @binding(0) var s: sampler;
+    @group(0) @binding(1) var t: texture_2d<f32>;
+    @fragment fn fs() -> @location(0) vec4f { return textureSample(t, s, vec2f(0.5, 0.5)); }` });
+  const pipe = DEV.createRenderPipeline({ layout: 'auto', vertex: { module: mod, entryPoint: 'cover' },
+    fragment: { module: mod, entryPoint: 'fs', targets: [{ format: 'rgba32float' }] }, primitive: { topology: 'triangle-list' } });
+  const bg = DEV.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries: [{ binding: 0, resource: samp }, { binding: 1, resource: tex.createView() }] });
+  const texel = await renderTexel(pipe, bg);
+  assertClose(texel[0], 2.0, 0.05, 'linear blend of 0 and 4 at center');
+  return { detail: `filtered midpoint of [0,4] = ${round(texel[0])} (≈2.0)` };
+}, { optional: true });
+
+// ============================================================================
+//  Runner + rendering
+// ============================================================================
+function fmt(x) {
+  if (x === undefined || x === '') return '';
+  if (Array.isArray(x)) return '[' + x.join(', ') + ']';
+  return String(x);
+}
+async function runWebGPUTests() {
+  const results = [];
+  for (const t of TESTS) {
+    const t0 = performance.now();
+    let status, detail = '', expected = '', actual = '';
+    try {
+      const r = await t.fn();
+      if (r && r.skip) { status = 'skip'; detail = r.reason || ''; }
+      else { status = 'pass'; if (r && r.detail) detail = r.detail; }
+    } catch (e) {
+      status = (t.optional && /unsupported|not available/i.test(e.message || '')) ? 'skip' : 'fail';
+      detail = e.message || String(e);
+      expected = fmt(e.expected); actual = fmt(e.actual);
+    }
+    results.push({ category: t.category, name: t.name, status, expected, actual, detail,
+                   ms: +(performance.now() - t0).toFixed(1), optional: t.optional });
+    renderRow(results[results.length - 1]);
+  }
+  window.__webgpuTestResults = results;
+  window.__webgpuTestsDone = true;
+  renderSummary(results);
+  return results;
+}
+
+let lastCat = '';
+function renderRow(r) {
+  const tb = document.getElementById('rows');
+  if (r.category !== lastCat) {
+    lastCat = r.category;
+    const ctr = document.createElement('tr'); ctr.className = 'cat';
+    const ctd = document.createElement('td'); ctd.colSpan = 5; ctd.textContent = r.category; ctr.appendChild(ctd); tb.appendChild(ctr);
+  }
+  const tr = document.createElement('tr');
+  const ev = (r.expected || r.actual) ? `\nexpected ${r.expected}\n  actual ${r.actual}` : '';
+  tr.innerHTML = `<td></td><td>${r.name}</td><td class="status ${r.status}">${r.status.toUpperCase()}</td><td>${r.ms}</td>`
+    + `<td class="detail">${escapeHtml(r.detail)}<span class="ev">${escapeHtml(ev)}</span></td>`;
+  tb.appendChild(tr);
+}
+function renderSummary(results) {
+  const pass = results.filter((r) => r.status === 'pass').length;
+  const fail = results.filter((r) => r.status === 'fail').length;
+  const skp = results.filter((r) => r.status === 'skip').length;
+  document.getElementById('summary').innerHTML =
+    `<span class="pill pass">PASS ${pass}</span><span class="pill fail">FAIL ${fail}</span><span class="pill skip">SKIP ${skp}</span>`
+    + `&nbsp; ${results.length} tests &nbsp;·&nbsp; ${escapeHtml(navigator.userAgent)}`;
+}
+function escapeHtml(s) { return String(s).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c])); }
+
+window.runWebGPUTests = runWebGPUTests;
+window.__webgpuTestsDone = false;
+// Auto-run on load; MCP/CI can also call window.runWebGPUTests() and poll window.__webgpuTestsDone.
+runWebGPUTests().catch((e) => {
+  document.getElementById('summary').innerHTML = `<span class="pill fail">FATAL</span> ${escapeHtml(e.message || String(e))}`;
+  window.__webgpuTestsError = e.message || String(e);
+  window.__webgpuTestsDone = true;
+});
+</script>
+</body>
+</html>
