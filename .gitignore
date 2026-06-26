@@ -94,3 +94,6 @@ examples/webgpuview/wasm/build/
 
 # Proprietary / local-only sample assets (never commit)
 examples/webgpuview/dragon-head-only.usdc
+
+# Local MCP config (machine-specific paths; each dev provides their own — see doc/testing.md)
+.mcp.json
